@@ -3,7 +3,7 @@
 
 This makes Linux trust certificates signed by `ca.crt` (for curl, browsers, system services).
 
-### ✅ Ubuntu / Debian
+### Ubuntu / Debian
 
 ```bash
 sudo cp ca.crt /usr/local/share/ca-certificates/my-ca.crt
@@ -18,7 +18,7 @@ ls /etc/ssl/certs | grep my-ca
 
 ---
 
-### ✅ RHEL / CentOS / Rocky / Alma
+### RHEL / CentOS / Rocky / Alma
 
 ```bash
 sudo cp ca.crt /etc/pki/ca-trust/source/anchors/my-ca.crt
@@ -27,7 +27,7 @@ sudo update-ca-trust
 
 ---
 
-### ✅ Arch Linux
+### Arch Linux
 
 ```bash
 sudo cp ca.crt /etc/ca-certificates/trust-source/anchors/my-ca.crt
@@ -109,7 +109,7 @@ RUN update-ca-certificates
 
 ---
 
-## 🔐 Important Security Notes
+## Important Security Notes
 
 - ✅ `ca.crt` → safe to distribute
 - ❌ `ca.key` → **must remain private**
@@ -119,18 +119,3 @@ RUN update-ca-certificates
 ```bash
 chmod 600 ca.key
 ```
-
----
-
-## ✅ What do you want to use this certificate for?
-
-Tell me **one of these**, and I’ll give you exact commands:
-
-- ✅ HTTPS server (Nginx / Apache)
-- ✅ Trust internal TLS (curl, Docker, system)
-- ✅ Java application
-- ✅ Kubernetes
-- ✅ VPN / mTLS
-- ✅ Something else
-
-I’ll tailor it precisely.
