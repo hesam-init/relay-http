@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────
+# Logging presets
+# ─────────────────────────────────────────────
+x-logging-default: &logging-default
+  driver: json-file
+  options:
+    max-file: "1"
+    max-size: "4m"
+
+# ─────────────────────────────────────────────
+# Services
+# ─────────────────────────────────────────────
+services:
+  relay-http:
+    build:
+      context: ${PWD}
+      dockerfile: Dockerfile
+      target: http-relay
+      network: host
+    image: relay-http:latest
+    container_name: relay-http
+    logging: *logging-default
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    command: -c /etc/relay-http/config.json
+    ports:
+      - "8085:8085"
+    dns:
+      - 10.185.68.113
+    volumes:
+      - $PWD/ca:/app/ca
+      - $PWD/config.json:/etc/relay-http/config.json:ro
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
