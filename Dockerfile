@@ -37,4 +37,6 @@ COPY . .
 
 EXPOSE 8085
 
+ENV DFT_HOST=0.0.0.0
+
 ENTRYPOINT ["python3", "main.py"]
