@@ -264,29 +264,68 @@ class ProxyServer:
     def _log_response_summary(self, url: str, response: bytes):
         status, headers, body = self.fronter._split_raw_response(response)
         host = (urlparse(url).hostname or "").lower()
+
         if status >= 300 or self._should_trace_host(host):
-            location = headers.get("location", "")
-            server = headers.get("server", "")
-            cf_ray = headers.get("cf-ray", "")
-            content_type = headers.get("content-type", "")
+            location = headers.get("location", "") or "-"
+            server = headers.get("server", "") or "-"
+            cf_ray = headers.get("cf-ray", "") or "-"
+            content_type = headers.get("content-type", "") or "-"
             body_len = len(body)
+
             body_hint = "-"
-            if "text/html" in content_type.lower() and body:
-                sample = body[:800].decode(errors="replace").lower()
+            rate_limited = False
+
+            # Handle text-like responses (HTML, plain text, JSON…)
+            if ("text" in content_type.lower() or "json" in content_type.lower()) and body:
+                sample = body[:1200].decode(errors="replace").lower()
+
+                # --- Structured HTML title extraction ---
                 if "<title>" in sample and "</title>" in sample:
                     title = sample.split("<title>", 1)[1].split("</title>", 1)[0]
-                    body_hint = title[:120]
+                    body_hint = title.strip()[:120] or "-"
+
+                # --- Known content patterns ---
                 elif "captcha" in sample:
                     body_hint = "captcha"
                 elif "turnstile" in sample:
                     body_hint = "turnstile"
                 elif "loading" in sample:
                     body_hint = "loading"
-            log.info(
-                "RESP ← %s status=%s type=%s len=%s server=%s location=%s cf-ray=%s hint=%s",
-                host or url[:60], status, content_type or "-", body_len,
-                server or "-", location or "-", cf_ray or "-", body_hint,
+
+                # --- Rate-limit / quota markers ---
+                rate_limit_markers = (
+                    "too many",
+                    "rate limit",
+                    "quota",
+                    "quota exceeded",
+                    "request limit",
+                    "دفعات زیاد",
+                    "بیش از حد",
+                    "سرویس در طول یک روز",
+                )
+
+                if any(m in sample for m in rate_limit_markers):
+                    rate_limited = True
+                    body_hint = "quota_exceeded"
+
+            log_msg = (
+                "RESP ← %s status=%s type=%s len=%s server=%s location=%s cf-ray=%s hint=%s"
             )
+            log_args = (
+                host or url[:60],
+                status,
+                content_type,
+                body_len,
+                server,
+                location,
+                cf_ray,
+                body_hint,
+            )
+
+            if rate_limited:
+                log.warning("RATE LIMIT detected! " + log_msg, *log_args)
+            else:
+                log.info(log_msg, *log_args)
 
     async def start(self):
         http_srv = await asyncio.start_server(self._on_client, self.host, self.port)
@@ -494,12 +533,17 @@ class ProxyServer:
         #   • port 443 → MITM + relay through Apps Script
         #   • port 80  → plain-HTTP relay through Apps Script
         #   • other    → give up (non-HTTP; can't be relayed)
+        # We use a shorter connect timeout for IP literals (4 s) because
+        # when the route is DPI-dropped, waiting longer doesn't help and
+        # clients like Telegram speed up DC-rotation when we fail fast.
         # We remember per-IP failures for a short while so subsequent
         # connects skip the doomed direct attempt.
         if _is_ip_literal(host):
             if not self._direct_temporarily_disabled(host):
                 log.info("Direct tunnel → %s:%d (IP literal)", host, port)
-                ok = await self._do_direct_tunnel(host, port, reader, writer)
+                ok = await self._do_direct_tunnel(
+                    host, port, reader, writer, timeout=4.0,
+                )
                 if ok:
                     return
                 self._remember_direct_failure(host, ttl=300)
@@ -733,7 +777,8 @@ class ProxyServer:
     async def _do_direct_tunnel(self, host: str, port: int,
                                 reader: asyncio.StreamReader,
                                 writer: asyncio.StreamWriter,
-                                connect_ip: str | None = None):
+                                connect_ip: str | None = None,
+                                timeout: float = 10.0):
         """Pipe raw TLS bytes directly to the target server.
 
         connect_ip overrides DNS: the TCP connection goes to that IP
@@ -744,7 +789,7 @@ class ProxyServer:
         """
         target_ip = connect_ip or host
         try:
-            r_remote, w_remote = await self._open_tcp_connection(target_ip, port, timeout=10)
+            r_remote, w_remote = await self._open_tcp_connection(target_ip, port, timeout=timeout)
         except Exception as e:
             log.error("Direct tunnel connect failed (%s via %s): %s",
                       host, target_ip, e)
@@ -875,17 +920,15 @@ class ProxyServer:
             #   • Telegram Desktop / MTProto over port 443 sends obfuscated
             #     non-TLS bytes — we literally cannot decrypt these, and
             #     since the target IP is blocked we can't direct-tunnel
-            #     either. The only workaround is to configure Telegram as
-            #     an HTTP proxy (not SOCKS5), so it sends hostnames our
-            #     SNI-rewrite path can handle.
+            #     either. Telegram will rotate to another DC on its own;
+            #     failing fast here lets that happen sooner.
             #   • Client CONNECTs but never speaks TLS (some probes).
             if _is_ip_literal(host) and port == 443:
-                log.warning(
-                    "MITM TLS handshake failed for %s:%d (%s). "
-                    "Likely non-TLS traffic (e.g. Telegram MTProto over "
-                    "SOCKS5). Cannot relay raw TCP to a blocked IP — "
-                    "use the HTTP proxy instead so hostnames are preserved.",
-                    host, port, e,
+                log.info(
+                    "Non-TLS traffic on %s:%d (likely Telegram MTProto / "
+                    "obfuscated protocol). This DC appears blocked; the "
+                    "client should rotate to another endpoint shortly.",
+                    host, port,
                 )
             elif port != 443:
                 log.debug(
@@ -951,7 +994,11 @@ class ProxyServer:
                     if b":" in raw_line:
                         k, v = raw_line.decode(errors="replace").split(":", 1)
                         headers[k.strip()] = v.strip()
-
+                        
+                # Shortening the length of X API URLs to prevent relay errors.
+                if host == "x.com" and  re.match(r"/i/api/graphql/[^/]+/[^?]+\?variables=", path):
+                    path = path.split("&")[0]
+                
                 # MITM traffic arrives as origin-form paths; SOCKS/plain HTTP can
                 # also send absolute-form requests. Normalize both to full URLs.
                 if path.startswith("http://") or path.startswith("https://"):
