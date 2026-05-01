@@ -33,6 +33,9 @@ services:
     volumes:
       - $PWD/ca:/app/ca
       - $PWD/config.json:/etc/relay-http/config.json:ro
+    environment:
+      DFT_HOST: "0.0.0.0"
+      DFT_LOG_LEVEL: "INFO"
     ulimits:
       nofile:
         soft: 65536
