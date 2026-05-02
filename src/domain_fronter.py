@@ -214,9 +214,17 @@ class DomainFronter:
         # Useful for sites that block GCP/Apps Script IPs (e.g. ChatGPT).
         en_cfg = config.get("exit_node") or {}
         self._exit_node_enabled: bool = bool(en_cfg.get("enabled", False))
-        self._exit_node_url: str = str(en_cfg.get("relay_url") or "").rstrip("/")
+        self._exit_node_provider: str = self._normalize_exit_node_provider(
+            en_cfg.get("provider"),
+        )
+        self._exit_node_url: str = self._resolve_exit_node_url(
+            self._exit_node_provider,
+            en_cfg,
+        )
         self._exit_node_psk: str = str(en_cfg.get("psk") or "")
         self._exit_node_mode: str = str(en_cfg.get("mode") or "selective").lower()
+        if self._exit_node_mode not in ("full", "selective"):
+            self._exit_node_mode = "selective"
         self._exit_node_hosts: frozenset[str] = frozenset(
             str(h).lower().strip().lstrip(".")
             for h in (en_cfg.get("hosts") or [])
@@ -224,8 +232,15 @@ class DomainFronter:
         )
         if self._exit_node_enabled and self._exit_node_url:
             log.info(
-                "Exit node enabled [mode=%s]: %s",
-                self._exit_node_mode, self._exit_node_url,
+                "Exit node enabled [mode=%s, provider=%s]: %s",
+                self._exit_node_mode,
+                self._exit_node_provider,
+                self._exit_node_url,
+            )
+        elif self._exit_node_enabled:
+            log.warning(
+                "Exit node is enabled but no URL is configured for provider '%s'",
+                self._exit_node_provider,
             )
 
         # Capability log for content encodings.
@@ -1107,6 +1122,62 @@ class DomainFronter:
 
     # ── Exit node relay ───────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_exit_node_provider(raw: object) -> str:
+        provider = str(raw or "custom").strip().lower()
+        aliases = {
+            "val": "valtown",
+            "val-town": "valtown",
+            "cloudflare_worker": "cloudflare",
+            "worker": "cloudflare",
+            "cf": "cloudflare",
+            "deno_deploy": "deno",
+        }
+        return aliases.get(provider, provider or "custom")
+
+    @classmethod
+    def _resolve_exit_node_url(cls, provider: str,
+                               en_cfg: dict[str, object]) -> str:
+        providers = en_cfg.get("providers")
+        if not isinstance(providers, dict):
+            providers = {}
+
+        def _pick_from(mapping: dict[str, object], *keys: str) -> str:
+            for key in keys:
+                value = mapping.get(key)
+                if isinstance(value, str):
+                    value = value.strip()
+                    if value:
+                        return value.rstrip("/")
+            return ""
+
+        # Beginner-first: one URL field is enough for all providers.
+        direct = _pick_from(en_cfg, "url")
+        if direct:
+            return direct
+
+        if provider == "valtown":
+            selected = _pick_from(en_cfg, "valtown_url", "val_url") or _pick_from(
+                providers, "valtown", "val_town", "val",
+            )
+        elif provider == "cloudflare":
+            selected = _pick_from(
+                en_cfg, "cloudflare_url", "worker_url", "cf_url",
+            ) or _pick_from(
+                providers, "cloudflare", "cloudflare_worker", "worker", "cf",
+            )
+        elif provider == "deno":
+            selected = _pick_from(en_cfg, "deno_url") or _pick_from(
+                providers, "deno", "deno_deploy",
+            )
+        else:
+            selected = ""
+
+        if selected:
+            return selected
+        # Backward compatibility for older config format.
+        return _pick_from(en_cfg, "relay_url")
+
     def _exit_node_matches(self, url: str) -> bool:
         """Return True if this URL should be routed through the exit node."""
         if not self._exit_node_enabled or not self._exit_node_url:
@@ -1123,22 +1194,22 @@ class DomainFronter:
         return False
 
     async def _relay_via_exit_node(self, payload: dict) -> bytes:
-        """Chain: Apps Script → exit node (val.town) → Destination.
+        """Chain: Apps Script → edge relay (exit node) → Destination.
 
         Traffic path:
           Client → [domain fronting TLS] → Apps Script (Google)
-                → [UrlFetchApp.fetch] → exit node (val.town / non-Google IP)
+                → [UrlFetchApp.fetch] → exit node (non-Google IP)
                 → [fetch()] → Destination
 
         This preserves the DPI bypass (Apps Script is always the outbound
         connection from the client's perspective) while giving the destination
         a non-Google exit IP — fixing Cloudflare Turnstile, ChatGPT, etc.
 
-        The inner payload going to val.town is base64-encoded and sent as the
+        The inner payload going to the exit node is base64-encoded and sent as the
         body of the outer Apps Script relay call, so Apps Script POSTs it to
         the exit node URL on our behalf.
         """
-        # Build inner payload: what val.town will execute
+        # Build inner payload: what the exit node will execute
         inner = dict(payload)
         inner["k"] = self._exit_node_psk
         inner_json = json.dumps(inner).encode()
@@ -1163,9 +1234,9 @@ class DomainFronter:
         # Send through the normal Apps Script relay path (H2 or H1 + retry)
         raw = await self._relay_with_retry(outer)
 
-        # raw is now the response from val.town (which is the inner relay JSON)
+        # raw is now the response from the exit node (inner relay JSON)
         # _parse_relay_response will decode it into the final HTTP response.
-        # But we need to unwrap one level: Apps Script gives us val.town's HTTP
+        # But we need to unwrap one level: Apps Script gives us exit node HTTP
         # response body (which is itself a relay JSON), so parse twice.
         _, _, apps_script_body = self._split_raw_response(raw)
         result = self._parse_relay_response(apps_script_body)
@@ -2405,10 +2476,137 @@ class DomainFronter:
         user_html = payload.get("userHtml")
         return user_html if isinstance(user_html, str) else None
 
+    # ── Apps Script error classifier ─────────────────────────────
+    # Patterns are matched against the lower-cased raw error string from
+    # Apps Script's `e` field.  Sources:
+    #   • https://developers.google.com/apps-script/guides/support/troubleshooting
+    #   • https://developers.google.com/apps-script/guides/services/quotas
+    #   • Google Issue Tracker (urlfetch / bandwidth quota issues)
+
+    # "Service invoked too many times for one day: urlfetch."
+    # "Bandwidth quota exceeded"
+    # "UrlFetch failed because too much upload bandwidth was used"
+    # "UrlFetch failed because too much traffic is being sent to the specified URL"
+    _QUOTA_PATTERNS = (
+        "service invoked too many times",
+        "invoked too many times",
+        "bandwidth quota exceeded",
+        "too much upload bandwidth",
+        "too much traffic",
+        "urlfetch",   # appears at end of the daily-quota message in all locales
+        "quota",
+        "exceeded",
+        "daily",
+        "rate limit",
+    )
+
+    # "Authorization is required to perform that action."
+    # "unauthorized"  (our own Code.gs response)
+    # "Access denied"
+    # "Permission denied"
+    _AUTH_PATTERNS = (
+        "authorization is required",
+        "unauthorized",
+        "not authorized",
+        "permission denied",
+        "access denied",
+    )
+
+    # "Error occurred due to a missing library version or a deployment version.
+    #  Error code Not_Found"
+    # "script id not found" / wrong Deployment ID
+    _DEPLOY_PATTERNS = (
+        "error code not_found",
+        "not_found",
+        "deployment",
+        "script id",
+        "scriptid",
+        "no script",
+    )
+
+    # "Server not available." / "Server error occurred, please try again."
+    _TRANSIENT_PATTERNS = (
+        "server not available",
+        "server error occurred",
+        "please try again",
+        "temporarily unavailable",
+    )
+
+    # "UrlFetch calls to <URL> are not permitted by your admin"
+    # "<Class> / Apiary.<Service> is disabled. Please contact your administrator"
+    _ADMIN_PATTERNS = (
+        "not permitted by your admin",
+        "contact your administrator",
+        "disabled. please contact",
+        "domain policy has disabled",
+        "administrator to enable",
+    )
+
+    @classmethod
+    def _classify_relay_error(cls, raw: str) -> str:
+        """Return a human-readable explanation for a known Apps Script error.
+
+        Covers every error category documented at:
+        developers.google.com/apps-script/guides/support/troubleshooting
+        """
+        lower = raw.lower()
+
+        if any(p in lower for p in cls._QUOTA_PATTERNS):
+            return (
+                "Apps Script quota exhausted. "
+                "Either the 20,000 URL-fetch calls/day limit or the 100 MB/day "
+                "bandwidth limit has been reached. "
+                "Wait up to 24 hours for the quota to reset, or create a second "
+                "Google account, deploy a fresh Apps Script there, and add its "
+                "script_id to config.json."
+            )
+
+        if any(p in lower for p in cls._AUTH_PATTERNS):
+            return (
+                "Apps Script rejected the request (auth/permission error). "
+                "Check: (1) AUTH_KEY in Code.gs matches 'auth_key' in config.json, "
+                "(2) the deployment is set to 'Execute as: Me / Anyone can access', "
+                "(3) you are using the Deployment ID (not the Script ID), "
+                "(4) the owning Google account has authorised the script by running "
+                "it manually at least once."
+            )
+
+        if any(p in lower for p in cls._DEPLOY_PATTERNS):
+            return (
+                "Apps Script deployment not found. "
+                "Verify 'script_id' in config.json is the Deployment ID "
+                "(not the Script ID), the deployment is active/not archived, "
+                "and you re-created the deployment after editing Code.gs."
+            )
+
+        if any(p in lower for p in cls._TRANSIENT_PATTERNS):
+            return (
+                "Google Apps Script server is temporarily unavailable. "
+                "This is a transient Google-side error — wait a moment and retry. "
+                f"(raw: {raw})"
+            )
+
+        if any(p in lower for p in cls._ADMIN_PATTERNS):
+            return (
+                "Apps Script is blocked by a Google Workspace admin policy. "
+                "Either the target URL is not on the admin's UrlFetch allowlist, "
+                "or a Google service used by the script has been disabled by the "
+                "domain administrator. Contact your Google Workspace admin. "
+                f"(raw: {raw})"
+            )
+
+        # Unknown — strip the leading 'Exception: ' / 'Error: ' prefix that
+        # Apps Script always prepends, so the message is shorter and cleaner.
+        cleaned = re.sub(r'^(Exception|Error):\s*', '', raw, flags=re.IGNORECASE).strip()
+        return f"Relay error from Apps Script: {cleaned or raw}"
+
     def _parse_relay_json(self, data: dict) -> bytes:
         """Convert a parsed relay JSON dict to raw HTTP response bytes."""
         if "e" in data:
-            return self._error_response(502, f"Relay error: {data['e']}")
+            raw_err = str(data["e"])
+            friendly = self._classify_relay_error(raw_err)
+            log.warning("Apps Script error — %s | raw: %s", friendly.split(".")[0], raw_err)
+            return self._error_response(502, friendly)
 
         status = data.get("s", 200)
         resp_headers = data.get("h", {})
