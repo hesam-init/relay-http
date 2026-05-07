@@ -20,7 +20,6 @@ import ssl
 import statistics
 import tempfile
 import time
-from dataclasses import dataclass
 from urllib.parse import urlparse
 
 try:
@@ -28,13 +27,12 @@ try:
 except Exception:  # optional dependency fallback
     certifi = None
 
-import codec
-from constants import (
+from core import codec
+from core.constants import (
     BATCH_MAX,
     BATCH_WINDOW_MACRO,
     BATCH_WINDOW_MICRO,
     CONN_TTL,
-    FRONT_SNI_POOL_GOOGLE,
     MAX_RESPONSE_BODY_BYTES,
     POOL_MAX,
     POOL_MIN_IDLE,
@@ -48,56 +46,60 @@ from constants import (
     TLS_CONNECT_TIMEOUT,
     WARM_POOL_COUNT,
 )
+from .fronting_support import (
+    HostStat,
+    build_sni_pool,
+    format_bytes_human,
+    format_elapsed_short,
+    parse_content_range,
+    progress_line,
+    render_progress_bar,
+    spool_read,
+    spool_write,
+    validate_range_response,
+)
+from .relay_response import (
+    classify_relay_error,
+    error_response,
+    extract_apps_script_user_html,
+    load_relay_json,
+    parse_relay_json,
+    parse_relay_response,
+    split_raw_response,
+    split_set_cookie,
+)
+from .http_reader import read_http_response
 
 log = logging.getLogger("Fronter")
 
 
-@dataclass
-class HostStat:
-    """Per-host traffic accounting — useful for profiling slow / heavy sites."""
-    requests: int = 0
-    cache_hits: int = 0
-    bytes: int = 0
-    total_latency_ns: int = 0
-    errors: int = 0
+def _mask_sid(sid: str) -> str:
+    """Return a safe display form of an Apps Script deployment ID.
 
+    Full deployment IDs look like ``AKfycbwLd8Ca2BIsMWs5uN3x7...``
+    and should never appear in log files or screenshots that users might
+    share in issue reports.  Show only the first 6 and last 4 characters
+    so it's identifiable but not usable to hijack the deployment:
 
-def _build_sni_pool(front_domain: str, overrides: list | None) -> list[str]:
-    """Build the list of SNIs to rotate through on new outbound TLS handshakes.
-
-    Priority:
-      1. Explicit `front_domains` list in config (overrides).
-      2. If `front_domain` is a Google property, use FRONT_SNI_POOL_GOOGLE
-         (all share the same Google edge IP, so rotation is invisible to
-         the relay but breaks DPI's "always www.google.com" heuristic).
-      3. Fall back to the single configured `front_domain`.
+        AKfycb…5dGE
     """
-    if overrides:
-        seen: set[str] = set()
-        out: list[str] = []
-        for item in overrides:
-            host = str(item).strip().lower().rstrip(".")
-            if host and host not in seen:
-                seen.add(host)
-                out.append(host)
-        if out:
-            return out
-    fd = (front_domain or "").lower().rstrip(".")
-    if fd.endswith(".google.com") or fd == "google.com":
-        # For Google fronting we prefer the curated pool order, which can be
-        # latency-biased for common censored networks. Include the configured
-        # front_domain if it is custom, but do not pin it first.
-        pool = list(FRONT_SNI_POOL_GOOGLE)
-        if fd and fd not in pool:
-            pool.insert(0, fd)
-        return pool
-    return [fd] if fd else ["www.google.com"]
+    if not sid or len(sid) <= 12:
+        return sid or "(none)"
+    return f"{sid[:6]}\u2026{sid[-4:]}"
 
 
 class DomainFronter:
     _STATIC_EXTS = STATIC_EXTS
-    _H2_FAILURE_COOLDOWN = 60.0
-    _H2_FAILURE_THRESHOLD = 3
+    _H2_FAILURE_COOLDOWN = 15.0   # reduced: DPI token bucket refills in ~8-10s
+    _H2_FAILURE_THRESHOLD = 5    # raised: needs genuine consecutive failures
+    # URL extensions that almost always produce large responses (fonts, images,
+    # media). These are isolated into their own H2 sub-batch so a 400 kB font
+    # doesn't block a 2 kB JS file waiting for the same Apps Script response.
+    _HEAVY_EXTENSIONS = frozenset({
+        "woff2", "woff", "ttf", "eot", "otf",
+        "jpg", "jpeg", "png", "gif", "webp", "avif", "ico",
+        "mp4", "mp3", "wav", "webm", "ogg", "flac",
+    })
     _DOWNLOAD_STREAM_COOLDOWN = 300.0
     _COALESCE_VARY_HEADERS = (
         "accept",
@@ -114,7 +116,7 @@ class DomainFronter:
         self.sni_host = config.get("front_domain", "www.google.com")
         # SNI rotation pool — rotated per new outbound TLS connection so
         # DPI systems can't fingerprint traffic as "always one SNI".
-        self._sni_hosts = _build_sni_pool(
+        self._sni_hosts = build_sni_pool(
             self.sni_host, config.get("front_domains"),
         )
         self._sni_idx = 0
@@ -126,6 +128,11 @@ class DomainFronter:
         self._script_idx = 0
         self.script_id = self._script_ids[0]  # backward compat / logging
         self._dev_available = False  # True if /dev endpoint works (no redirect, ~400ms faster)
+
+        # Simple execution monitor: log total consumed Apps Script executions.
+        self._execution_report_interval = 5.0
+        self._exec_total = 0
+        self._execution_task: asyncio.Task | None = None
 
         # Fan-out parallel relay: fire N Apps Script instances concurrently,
         # keep the first successful response, cancel the rest. Script IDs
@@ -146,6 +153,9 @@ class DomainFronter:
 
         self.auth_key = config.get("auth_key", "")
         self.verify_ssl = config.get("verify_ssl", True)
+        # Build the SSLContext once so every TLS connection open reuses it
+        # instead of rebuilding the CA bundle and context on each dial.
+        self._ssl_context: ssl.SSLContext = self._build_ssl_ctx(self.verify_ssl)
         self._relay_timeout = self._cfg_float(
             config, "relay_timeout", RELAY_TIMEOUT, minimum=1.0,
         )
@@ -153,10 +163,9 @@ class DomainFronter:
             config, "tls_connect_timeout", TLS_CONNECT_TIMEOUT, minimum=1.0,
         )
         self._sni_probe_timeout = min(self._tls_connect_timeout, 4.0)
-        self._max_response_body_bytes = self._cfg_int(
-            config, "max_response_body_bytes", MAX_RESPONSE_BODY_BYTES,
-            minimum=1024,
-        )
+        # Keep response cap as a code-level constant to avoid exposing an
+        # advanced memory-safety knob in end-user config.
+        self._max_response_body_bytes = MAX_RESPONSE_BODY_BYTES
 
         # Connection pool — TTL-based, pre-warmed, with concurrency control
         self._pool: list[tuple[asyncio.StreamReader, asyncio.StreamWriter, float]] = []
@@ -171,17 +180,30 @@ class DomainFronter:
         self._keepalive_task: asyncio.Task | None = None
         self._warm_task: asyncio.Task | None = None
         self._bg_tasks: set[asyncio.Task] = set()
+        # Set by _do_warm() when the initial TLS connection batch is open.
+        # The very first relay() call awaits this (with a short timeout) so it
+        # never dispatches a request onto a completely cold pool.
+        self._pool_ready = asyncio.Event()
 
         # Batch collector for grouping concurrent relay() calls
         self._batch_lock = asyncio.Lock()
         self._batch_pending: list[tuple[dict, asyncio.Future]] = []
         self._batch_task: asyncio.Task | None = None
-        self._batch_window_micro = BATCH_WINDOW_MICRO
-        self._batch_window_macro = BATCH_WINDOW_MACRO
-        self._batch_max = BATCH_MAX
-        self._batch_enabled = True
+        self._batch_window_micro = float(config.get("batch_window_micro", BATCH_WINDOW_MICRO))
+        self._batch_window_macro = float(config.get("batch_window_macro", BATCH_WINDOW_MACRO))
+        self._batch_max = int(config.get("batch_max", BATCH_MAX))
+        # enable_batch=false → each request gets its own H2 stream → N×2 KiB/s
+        # aggregate throughput instead of all requests sharing one stream.
+        # Recommended when DPI does per-stream rate limiting (e.g. Iran).
+        self._batch_permanent_disable: bool = not bool(config.get("enable_batch", True))
+        self._batch_enabled = not self._batch_permanent_disable
         self._batch_disabled_at = 0.0
         self._batch_cooldown = 60
+        # enable_sub_batch=false → all batches are sent as a single Apps Script
+        # call regardless of how many H2 connections are live.  Saves quota at
+        # the cost of parallel DPI bypass (each connection no longer gets its
+        # own token bucket).  Useful when quota is the binding constraint.
+        self._sub_batch_enabled: bool = bool(config.get("enable_sub_batch", True))
 
         # Request coalescing — dedup concurrent identical GETs
         self._coalesce: dict[str, list[asyncio.Future]] = {}
@@ -189,17 +211,39 @@ class DomainFronter:
         self._h2_disabled_until = 0.0
         self._stream_download_disabled_until: dict[str, float] = {}
 
-        # HTTP/2 multiplexing — one connection handles all requests
+        # HTTP/2 multiplexing — pool of parallel connections for DPI bypass.
+        # Iran's DPI shapes per-TCP-connection; N separate connections each
+        # get their own independent token bucket, giving ~N× throughput.
         self._h2 = None
+        self._h2_pool: list = []
+        self._h2_pool_idx: int = 0
         try:
-            from h2_transport import H2Transport, H2_AVAILABLE
+            from .h2_transport import H2Transport, H2_AVAILABLE
             if H2_AVAILABLE:
-                self._h2 = H2Transport(
-                    self.connect_host, self.sni_host, self.verify_ssl,
-                    sni_hosts=self._sni_hosts,
+                try:
+                    n_conns = max(1, int(config.get("h2_connections", 3)))
+                except (TypeError, ValueError):
+                    n_conns = 3
+                no_sni = bool(config.get("no_sni", False))
+                try:
+                    ping_interval = float(config.get("ping_interval", 0.2))
+                except (TypeError, ValueError):
+                    ping_interval = 0.2
+                self._h2_pool = [
+                    H2Transport(
+                        self.connect_host, self.sni_host, self.verify_ssl,
+                        sni_hosts=self._sni_hosts,
+                        no_sni=no_sni,
+                        ping_interval=ping_interval,
+                    )
+                    for _ in range(n_conns)
+                ]
+                self._h2 = self._h2_pool[0]  # primary; used for ping/reconnect
+                log.info(
+                    "HTTP/2 multiplexing available — %d parallel connections "
+                    "(each gets its own DPI token bucket)",
+                    n_conns,
                 )
-                log.info("HTTP/2 multiplexing available — "
-                         "all requests will share one connection")
         except ImportError:
             pass
 
@@ -209,6 +253,23 @@ class DomainFronter:
         if self._parallel_relay > 1:
             log.info("Fan-out relay: %d parallel Apps Script instances per request",
                      self._parallel_relay)
+        log.info(
+            "Execution monitor enabled: reporting total every %.0fs",
+            self._execution_report_interval,
+        )
+        if self._batch_permanent_disable:
+            log.info(
+                "Batch DISABLED (enable_batch=false) — each request fires its own "
+                "H2 stream for N×2 KiB/s aggregate throughput"
+            )
+        else:
+            log.info(
+                "Batch config: micro=%.0fms macro=%.0fms max=%d sub_batch=%s",
+                self._batch_window_micro * 1000.0,
+                self._batch_window_macro * 1000.0,
+                self._batch_max,
+                "on" if self._sub_batch_enabled else "off",
+            )
 
         # Exit node — optional second-hop relay with a non-Google exit IP.
         # Useful for sites that block GCP/Apps Script IPs (e.g. ChatGPT).
@@ -265,39 +326,111 @@ class DomainFronter:
             value = default
         return max(minimum, value)
 
-    def _ssl_ctx(self) -> ssl.SSLContext:
+    def _record_execution(self, sid: str, count: int = 1) -> None:
+        """Record consumed Apps Script executions."""
+        if not sid or count <= 0:
+            return
+        self._exec_total += count
+
+    async def _execution_logger(self):
+        """Log execution usage every N seconds, only when the count changed."""
+        interval = self._execution_report_interval
+        last_reported = -1
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if self._exec_total != last_reported:
+                    last_reported = self._exec_total
+                    log.info("Apps Script executions used so far: %d", self._exec_total)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.debug("Execution logger error: %s", exc)
+
+    @staticmethod
+    def _build_ssl_ctx(verify_ssl: bool) -> ssl.SSLContext:
         ctx = ssl.create_default_context()
         if certifi is not None:
             try:
                 ctx.load_verify_locations(cafile=certifi.where())
             except Exception:
                 pass
-        if not self.verify_ssl:
+        if not verify_ssl:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
+    def _ssl_ctx(self) -> ssl.SSLContext:
+        return self._ssl_context
+
     def _h2_available(self) -> bool:
-        return (
-            self._h2 is not None
-            and self._h2.is_connected
-            and time.time() >= self._h2_disabled_until
-        )
+        if not self._h2_pool or time.time() < self._h2_disabled_until:
+            return False
+        return any(t.is_connected for t in self._h2_pool)
+
+    def _pick_h2(self):
+        """Round-robin pick a connected H2Transport from the pool.
+
+        Distributes relay requests across multiple TCP connections so each
+        benefits from its own independent DPI throughput budget.
+        Returns the primary transport when none are connected (caller will
+        trigger reconnection via the normal failure/cooldown path).
+        """
+        pool = self._h2_pool
+        n = len(pool)
+        if not n:
+            return self._h2
+        for i in range(n):
+            t = pool[(self._h2_pool_idx + i) % n]
+            if t.is_connected:
+                self._h2_pool_idx = (self._h2_pool_idx + i + 1) % n
+                return t
+        # None connected — advance index and return primary
+        self._h2_pool_idx = (self._h2_pool_idx + 1) % n
+        return pool[0]
 
     def _record_h2_success(self) -> None:
         self._h2_failure_streak = 0
 
     def _record_h2_failure(self, exc: Exception) -> None:
         self._h2_failure_streak += 1
-        if self._h2_failure_streak >= self._H2_FAILURE_THRESHOLD:
-            self._h2_disabled_until = time.time() + self._H2_FAILURE_COOLDOWN
+        # Extend the cooldown window on every failure so a burst of concurrent
+        # failures doesn't shorten the effective cooldown.
+        self._h2_disabled_until = max(
+            self._h2_disabled_until,
+            time.time() + self._H2_FAILURE_COOLDOWN,
+        )
+        # Log exactly once when the threshold is first crossed.  Using ==
+        # (not >=) avoids re-logging on every subsequent failure from
+        # concurrent in-flight requests that all fail at the same moment.
+        if self._h2_failure_streak == self._H2_FAILURE_THRESHOLD:
             log.warning(
                 "H2 temporarily disabled for %.0fs after %d consecutive failures (%s)",
                 self._H2_FAILURE_COOLDOWN,
                 self._h2_failure_streak,
                 type(exc).__name__,
             )
-            self._h2_failure_streak = 0
+
+    @staticmethod
+    def _is_h2_transport_error(exc: BaseException) -> bool:
+        """Return True only for genuine H2 *transport* failures.
+
+        Apps Script request timeouts (TimeoutError) and application-level
+        errors are NOT H2 transport failures — the connection may be fine.
+        Counting them pushes the failure streak toward the disable threshold
+        even when H2 is healthy, which causes unnecessary 15s fallbacks.
+        Only connection-level errors should disable H2.
+        """
+        if isinstance(exc, asyncio.TimeoutError):
+            return False
+        if isinstance(exc, (ConnectionError, OSError, ssl.SSLError)):
+            return True
+        msg = str(exc).lower()
+        return any(k in msg for k in (
+            "connection closed", "connection lost", "stream error",
+            "alpn negotiation", "transport closed", "h2 reader",
+            "eof", "broken pipe",
+        ))
 
     def _stream_download_allowed(self, url: str) -> bool:
         host = self._host_key(url)
@@ -397,9 +530,9 @@ class DomainFronter:
 
         self._sni_hosts = reordered
         self._sni_idx = 0
-        if self._h2 is not None:
-            self._h2._sni_hosts = list(reordered)
-            self._h2._sni_idx = 0
+        for _t in self._h2_pool:
+            _t._sni_hosts = list(reordered)
+            _t._sni_idx = 0
         log.info(
             "SNI pool re-ranked by local probe: %s",
             ", ".join(f"{sni} ({ms:.0f}ms)" for ms, sni in ranked),
@@ -485,7 +618,7 @@ class DomainFronter:
                 reader, writer, created = self._pool.pop()
                 if (now - created) < self._conn_ttl and not reader.at_eof():
                     # Eagerly replace the connection we just took
-                    asyncio.create_task(self._add_conn_to_pool())
+                    self._spawn(self._add_conn_to_pool())
                     return reader, writer, created
                 try:
                     writer.close()
@@ -551,7 +684,7 @@ class DomainFronter:
             return  # Nothing to fall back to — blacklist would be pointless.
         self._sid_blacklist[sid] = time.time() + self._blacklist_ttl
         log.warning("Blacklisted script %s for %ds%s",
-                    sid[-8:] if len(sid) > 8 else sid,
+                    _mask_sid(sid),
                     int(self._blacklist_ttl),
                     f" ({reason})" if reason else "")
 
@@ -626,87 +759,6 @@ class DomainFronter:
         lines.append("")
         return "\r\n".join(lines).encode()
 
-    @staticmethod
-    def _parse_content_range(value: str) -> tuple[int, int, int] | None:
-        match = re.match(r"^\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$", value or "")
-        if not match:
-            return None
-        start, end, total = (int(group) for group in match.groups())
-        if start < 0 or end < start or total <= end:
-            return None
-        return start, end, total
-
-    @classmethod
-    def _validate_range_response(cls, status: int, resp_headers: dict,
-                                 body: bytes, start_off: int,
-                                 end_off: int,
-                                 total_size: int | None = None) -> str | None:
-        if status != 206:
-            return f"status {status}"
-        parsed = cls._parse_content_range(resp_headers.get("content-range", ""))
-        if not parsed:
-            return "missing/invalid Content-Range"
-        got_start, got_end, got_total = parsed
-        if got_start != start_off or got_end != end_off:
-            return f"Content-Range mismatch {got_start}-{got_end}"
-        if total_size is not None and got_total != total_size:
-            return f"Content-Range total mismatch {got_total}/{total_size}"
-        expected = end_off - start_off + 1
-        if len(body) != expected:
-            return f"short chunk {len(body)}/{expected} B"
-        return None
-
-    @staticmethod
-    def _spool_write(file_obj, offset: int, data: bytes) -> None:
-        file_obj.seek(offset)
-        file_obj.write(data)
-        file_obj.flush()
-
-    @staticmethod
-    def _spool_read(file_obj, offset: int, size: int) -> bytes:
-        file_obj.seek(offset)
-        return file_obj.read(size)
-
-    @staticmethod
-    def _format_bytes_human(num_bytes: int) -> str:
-        value = float(max(0, num_bytes))
-        units = ("B", "KiB", "MiB", "GiB", "TiB")
-        unit = units[0]
-        for unit in units:
-            if value < 1024.0 or unit == units[-1]:
-                break
-            value /= 1024.0
-        if unit == "B":
-            return f"{int(value)} {unit}"
-        return f"{value:.1f} {unit}"
-
-    @staticmethod
-    def _format_elapsed_short(seconds: float) -> str:
-        total = max(0, int(seconds))
-        minutes, secs = divmod(total, 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-        return f"{minutes:02d}:{secs:02d}"
-
-    @staticmethod
-    def _render_progress_bar(done: int, total: int, width: int = 34) -> str:
-        if total <= 0:
-            return "[" + ("-" * width) + "]"
-        ratio = max(0.0, min(1.0, done / total))
-        filled = min(width, int(round(ratio * width)))
-        return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
-
-    @classmethod
-    def _progress_line(cls, *, elapsed: float, done: int, total: int,
-                       speed_bytes_per_sec: float) -> str:
-        return (
-            f"[{cls._format_elapsed_short(elapsed)}] "
-            f"{cls._render_progress_bar(done, total)} "
-            f"{cls._format_bytes_human(done)} / {cls._format_bytes_human(total)} "
-            f"({cls._format_bytes_human(int(speed_bytes_per_sec))}/s)"
-        )
-
     async def _relay_payload_h1(self, payload: dict) -> bytes:
         attempts = self._retry_attempts_for_payload(payload)
         async with self._semaphore:
@@ -745,7 +797,7 @@ class DomainFronter:
                 await asyncio.sleep(0.3 * (attempt + 1))
                 continue
 
-            last_status, _, _ = self._split_raw_response(last_raw)
+            last_status, _, _ = split_raw_response(last_raw)
             if last_status == 206 or last_status < 500:
                 return last_raw
             if attempt < max_tries - 1:
@@ -788,7 +840,7 @@ class DomainFronter:
         per_site.sort(key=lambda x: x["bytes"], reverse=True)
         now = time.time()
         blacklisted = [
-            {"sid": sid[-12:] if len(sid) > 12 else sid,
+            {"sid": _mask_sid(sid),
              "expires_in_s": int(max(0, until - now))}
             for sid, until in self._sid_blacklist.items() if until > now
         ]
@@ -819,7 +871,7 @@ class DomainFronter:
                     )
                 if snap["blacklisted_scripts"]:
                     log.debug("  blacklisted scripts: %s",
-                              ", ".join(f"{b['sid']} ({b['expires_in_s']}s)"
+                              ", ".join(f"{_mask_sid(b['sid'])} ({b['expires_in_s']}s)"
                                         for b in snap["blacklisted_scripts"]))
             except asyncio.CancelledError:
                 break
@@ -939,6 +991,8 @@ class DomainFronter:
         # Periodic per-host stats logger (opt-in via log level)
         if self._stats_task is None:
             self._stats_task = self._spawn(self._stats_logger())
+        if self._execution_task is None:
+            self._execution_task = self._spawn(self._execution_logger())
         # Start H2 connection (runs alongside H1 pool)
         if self._h2:
             self._spawn(self._h2_connect_and_warm())
@@ -946,6 +1000,23 @@ class DomainFronter:
         # container never goes cold even when H2 is unavailable.  When H2 IS
         # active its _keepalive_loop skips the ping; they do not double-fire.
         self._spawn(self._h1_container_keepalive())
+
+    async def wait_until_warm(self, timeout: float | None = None) -> bool:
+        """Start warmup and wait until the initial pool-open phase finishes.
+
+        Returns True if warmup finished before timeout, else False.
+        """
+        await self._warm_pool()
+        if self._pool_ready.is_set():
+            return True
+        try:
+            if timeout is None or timeout <= 0:
+                await self._pool_ready.wait()
+            else:
+                await asyncio.wait_for(self._pool_ready.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def _spawn(self, coro) -> asyncio.Task:
         """Create a task and keep a strong reference for clean cancellation."""
@@ -966,38 +1037,60 @@ class DomainFronter:
         self._warm_task = None
         self._maintenance_task = None
         self._stats_task = None
+        self._execution_task = None
         self._keepalive_task = None
 
         await self._flush_pool()
 
-        if self._h2:
+        for _t in self._h2_pool:
             try:
-                await self._h2.close()
+                await _t.close()
             except Exception as exc:
-                log.debug("h2 close: %s", exc)
+                log.debug("h2 pool close: %s", exc)
 
     async def _h2_connect(self):
-        """Connect the HTTP/2 transport in background."""
-        if self._h2 is None:
+        """Connect all HTTP/2 transports in the pool."""
+        if not self._h2_pool:
             return
         if time.time() < self._h2_disabled_until:
             return
         try:
             await self._ensure_sni_ranked()
-            await self._h2.ensure_connected()
-            self._record_h2_success()
-            log.info("H2 multiplexing active — one conn handles all requests")
+            results = await asyncio.gather(
+                *[t.ensure_connected() for t in self._h2_pool],
+                return_exceptions=True,
+            )
+            connected = sum(1 for r in results if not isinstance(r, Exception))
+            if connected > 0:
+                self._record_h2_success()
+                log.info(
+                    "H2 multiplexing active — %d/%d connections live",
+                    connected, len(self._h2_pool),
+                )
+            else:
+                exc = next(r for r in results if isinstance(r, Exception))
+                self._record_h2_failure(exc)
+                log.warning(
+                    "H2 connect failed (%s: %s), using H1 pool fallback",
+                    type(exc).__name__, exc or "(no details)",
+                )
         except Exception as e:
             self._record_h2_failure(e)
-            log.warning("H2 connect failed (%s), using H1 pool fallback", e)
+            log.warning(
+                "H2 connect failed (%s: %s), using H1 pool fallback",
+                type(e).__name__,
+                e or "(no details)",
+            )
 
     async def _h2_connect_and_warm(self):
         """Connect H2, pre-warm the Apps Script container, start keepalive."""
         await self._h2_connect()
         if self._h2_available():
             self._spawn(self._prewarm_script())
-            if self._keepalive_task is None or self._keepalive_task.done():
-                self._keepalive_task = self._spawn(self._keepalive_loop())
+        # Always start keepalive — even on startup failure it will retry H2
+        # once the cooldown expires instead of leaving H1-only permanently.
+        if self._keepalive_task is None or self._keepalive_task.done():
+            self._keepalive_task = self._spawn(self._keepalive_loop())
 
     async def _prewarm_script(self):
         """Pre-warm Apps Script and detect /dev fast path (no redirect)."""
@@ -1012,6 +1105,7 @@ class DomainFronter:
         try:
             dev_path = f"/macros/s/{sid}/dev"
             t0 = time.perf_counter()
+            self._record_execution(sid)
             status, _, body = await asyncio.wait_for(
                 self._h2.request(
                     method="POST", path=dev_path, host=self.http_host,
@@ -1020,7 +1114,7 @@ class DomainFronter:
                 timeout=15,
             )
             dt = (time.perf_counter() - t0) * 1000
-            data = self._load_relay_json(body.decode(errors="replace"))
+            data = load_relay_json(body.decode(errors="replace"))
             if "s" in data:
                 self._dev_available = True
                 log.info("/dev fast path active (%.0fms, no redirect)", dt)
@@ -1032,6 +1126,7 @@ class DomainFronter:
         try:
             exec_path = f"/macros/s/{sid}/exec"
             t0 = time.perf_counter()
+            self._record_execution(sid)
             await asyncio.wait_for(
                 self._h2.request(
                     method="POST", path=exec_path, host=self.http_host,
@@ -1048,23 +1143,50 @@ class DomainFronter:
         """Send periodic pings to keep Apps Script warm + H2 connection alive."""
         while True:
             try:
-                await asyncio.sleep(240)  # 4 minutes — saves ~90 quota hits/day vs 180s
-                                          # Google's container timeout is ~5 min idle
-                if not self._h2_available():
-                    try:
-                        await self._h2.reconnect()
-                        self._record_h2_success()
-                    except Exception as exc:
-                        self._record_h2_failure(exc)
-                        continue
+                # 60s cadence: Iran DPI/NAT can drop idle connections in ~30-60s.
+                # Pinging every 60s keeps all pool members alive without burning
+                # significant Apps Script quota.
+                await asyncio.sleep(60)
 
-                # H2 PING to keep connection alive
-                await self._h2.ping()
+                # If H2 is absent or still in cooldown, skip this tick.
+                if self._h2 is None or time.time() < self._h2_disabled_until:
+                    continue
+
+                # Reconnect any disconnected pool members.
+                for _t in list(self._h2_pool):
+                    if not _t.is_connected:
+                        try:
+                            await asyncio.wait_for(
+                                _t.reconnect(),
+                                timeout=max(self._tls_connect_timeout, 8.0),
+                            )
+                            self._record_h2_success()
+                            log.info("H2 connection re-established")
+                        except Exception as exc:
+                            # Keepalive reconnect failures are background recovery
+                            # attempts — do NOT count them toward the disable
+                            # threshold or healthy traffic gets penalised.
+                            log.debug("H2 background reconnect failed: %s", exc)
+
+                if not any(t.is_connected for t in self._h2_pool):
+                    continue  # all transports down — skip ping
+
+                # H2 PING frame to every connected pool member.
+                # This tells each OS/DPI that the TCP connection is still in use,
+                # preventing the 30-60s idle-reset that Iran DPI applies.
+                for _t in self._h2_pool:
+                    if _t.is_connected:
+                        try:
+                            await _t.ping()
+                        except Exception:
+                            pass
 
                 # Apps Script keepalive — warm the container
                 payload = {"m": "GET", "u": "http://example.com/", "k": self.auth_key}
-                path = self._exec_path("example.com")
+                sid = self._script_id_for_key(self._host_key("example.com"))
+                path = self._exec_path_for_sid(sid)
                 t0 = time.perf_counter()
+                self._record_execution(sid)
                 await asyncio.wait_for(
                     self._h2.request(
                         method="POST", path=path, host=self.http_host,
@@ -1116,6 +1238,27 @@ class DomainFronter:
         results = await asyncio.gather(*coros, return_exceptions=True)
         opened = sum(1 for r in results if not isinstance(r, Exception))
         log.info("Pre-warmed %d/%d TLS connections", opened, count)
+        # Signal that at least the pool-open phase finished so relay() can
+        # stop waiting on the first request.
+        self._pool_ready.set()
+
+    async def _reconnect_pool_members(self) -> None:
+        """Background: reconnect any H2 pool members that dropped.
+
+        Called after a transport error in the relay path so connections are
+        recovered promptly instead of waiting for the next keepalive tick.
+        Does NOT increment the failure streak — this is a recovery action.
+        """
+        for _t in self._h2_pool:
+            if not _t.is_connected:
+                try:
+                    await asyncio.wait_for(
+                        _t.reconnect(),
+                        timeout=max(self._tls_connect_timeout, 8.0),
+                    )
+                    log.debug("H2 pool member recovered")
+                except Exception as exc:
+                    log.debug("H2 pool member reconnect failed: %s", exc)
 
     def _auth_header(self) -> str:
         return f"X-Auth-Key: {self.auth_key}\r\n" if self.auth_key else ""
@@ -1126,12 +1269,14 @@ class DomainFronter:
     def _normalize_exit_node_provider(raw: object) -> str:
         provider = str(raw or "custom").strip().lower()
         aliases = {
-            "val": "valtown",
-            "val-town": "valtown",
             "cloudflare_worker": "cloudflare",
             "worker": "cloudflare",
             "cf": "cloudflare",
             "deno_deploy": "deno",
+            "self_hosted": "vps",
+            "self-hosted": "vps",
+            "selfhosted": "vps",
+            "server": "vps",
         }
         return aliases.get(provider, provider or "custom")
 
@@ -1156,11 +1301,7 @@ class DomainFronter:
         if direct:
             return direct
 
-        if provider == "valtown":
-            selected = _pick_from(en_cfg, "valtown_url", "val_url") or _pick_from(
-                providers, "valtown", "val_town", "val",
-            )
-        elif provider == "cloudflare":
+        if provider == "cloudflare":
             selected = _pick_from(
                 en_cfg, "cloudflare_url", "worker_url", "cf_url",
             ) or _pick_from(
@@ -1169,6 +1310,12 @@ class DomainFronter:
         elif provider == "deno":
             selected = _pick_from(en_cfg, "deno_url") or _pick_from(
                 providers, "deno", "deno_deploy",
+            )
+        elif provider == "vps":
+            selected = _pick_from(
+                en_cfg, "vps_url", "server_url", "self_hosted_url",
+            ) or _pick_from(
+                providers, "vps", "self_hosted", "server",
             )
         else:
             selected = ""
@@ -1209,9 +1356,18 @@ class DomainFronter:
         body of the outer Apps Script relay call, so Apps Script POSTs it to
         the exit node URL on our behalf.
         """
-        # Build inner payload: what the exit node will execute
+        # Build inner payload: what the exit node will execute.
+        # Strip accept-encoding from the inner headers so the target site
+        # returns an uncompressed body.  Exit nodes (CF Worker, VPS) make
+        # plain Python/JS fetch() calls that don't auto-decompress, so a
+        # compressed response body would be forwarded as garbled bytes.
         inner = dict(payload)
         inner["k"] = self._exit_node_psk
+        if isinstance(inner.get("h"), dict):
+            inner["h"] = {
+                k: v for k, v in inner["h"].items()
+                if k.lower() != "accept-encoding"
+            }
         inner_json = json.dumps(inner).encode()
 
         # Build outer payload: what Apps Script will fetch
@@ -1231,15 +1387,17 @@ class DomainFronter:
             payload.get("u", "")[:60],
         )
 
-        # Send through the normal Apps Script relay path (H2 or H1 + retry)
-        raw = await self._relay_with_retry(outer)
+        # Send through the batch collector so exit-node requests are coalesced
+        # into fetchAll() alongside other concurrent requests, reducing Apps
+        # Script quota usage.  _relay_with_retry bypasses batching entirely.
+        raw = await self._batch_submit(outer)
 
         # raw is now the response from the exit node (inner relay JSON)
         # _parse_relay_response will decode it into the final HTTP response.
         # But we need to unwrap one level: Apps Script gives us exit node HTTP
         # response body (which is itself a relay JSON), so parse twice.
-        _, _, apps_script_body = self._split_raw_response(raw)
-        result = self._parse_relay_response(apps_script_body)
+        _, _, apps_script_body = split_raw_response(raw)
+        result = parse_relay_response(apps_script_body, self._max_response_body_bytes)
         log.debug("Exit node relay OK: %s", payload.get("u", "")[:80])
         return result
 
@@ -1260,6 +1418,36 @@ class DomainFronter:
         """
         if not self._warmed:
             await self._warm_pool()
+
+        # On the very first request, wait up to one TLS-connect-timeout for the
+        # pool to have at least one open connection.  This prevents the first
+        # browser request from racing onto a completely cold pool.  The wait is
+        # capped so a slow network never blocks the user indefinitely — the
+        # normal retry/fallback path handles it from there.
+        if not self._pool_ready.is_set():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._pool_ready.wait()),
+                    timeout=self._tls_connect_timeout,
+                )
+            except asyncio.TimeoutError:
+                log.debug("Pool warm timeout — proceeding with cold pool")
+
+        # SABR / videoplayback: strip quality-track selection fields (field 3,
+        # tag 0x1a) from the top-level protobuf before relaying.  Those entries
+        # ask googlevideo to bundle multiple simultaneous quality tracks into one
+        # response, which easily exceeds Apps Script UrlFetchApp's ~10 MB buffer
+        # and produces "Response too large" → 502.  Removing them forces a
+        # single-track response that stays within the limit.
+        if method == "POST" and body and "/videoplayback" in url:
+            stripped = self._strip_sabr_quality_tracks(body)
+            if stripped != body:
+                log.debug(
+                    "SABR strip: removed %d quality-track bytes from %s",
+                    len(body) - len(stripped),
+                    url.split("?")[0][-60:],
+                )
+                body = stripped
 
         payload = self._build_payload(method, url, headers, body)
 
@@ -1296,12 +1484,7 @@ class DomainFronter:
             # Coalesce concurrent GETs for the same URL.
             # CRITICAL: do NOT coalesce when a Range header is present —
             # parallel range downloads MUST each hit the server independently.
-            has_range = False
-            if headers:
-                for k in headers:
-                    if k.lower() == "range":
-                        has_range = True
-                        break
+            has_range = bool(self._header_value(headers, "range"))
             if method == "GET" and not body and not has_range:
                 result = await self._coalesced_submit(
                     self._coalesce_key(url, headers), payload,
@@ -1383,7 +1566,7 @@ class DomainFronter:
         # Probe: first chunk with Range header
         first_resp = await self._range_probe(url, headers, 0, chunk_size - 1)
 
-        status, resp_hdrs, resp_body = self._split_raw_response(first_resp)
+        status, resp_hdrs, resp_body = split_raw_response(first_resp)
 
         # No range support → return the single response as-is (status 200
         # from the origin). The client sent a plain GET, so 200 is what it
@@ -1392,23 +1575,23 @@ class DomainFronter:
             return first_resp
 
         # Parse total size from Content-Range: "bytes 0-262143/1048576"
-        parsed_range = self._parse_content_range(resp_hdrs.get("content-range", ""))
+        parsed_range = parse_content_range(resp_hdrs.get("content-range", ""))
         if not parsed_range:
             # Can't parse — downgrade to 200 so the client (which sent a
             # plain GET) doesn't get confused by 206 + Content-Range.
             return self._rewrite_206_to_200(first_resp)
         first_start, first_end, total_size = parsed_range
-        first_err = self._validate_range_response(
+        first_err = validate_range_response(
             status, resp_hdrs, resp_body, first_start, first_end, total_size,
         )
         if first_start != 0 or first_err:
             return self._rewrite_206_to_200(first_resp)
         if total_size > self._max_response_body_bytes:
-            return self._error_response(
+            return error_response(
                 502,
                 "Relay response exceeds cap "
                 f"({self._max_response_body_bytes} bytes). "
-                "Increase max_response_body_bytes if your system has enough RAM.",
+                "Increase MAX_RESPONSE_BODY_BYTES in src/core/constants.py if your system has enough RAM.",
             )
         if min_size > 0 and total_size < min_size:
             return self._rewrite_206_to_200(first_resp)
@@ -1464,8 +1647,8 @@ class DomainFronter:
                 for attempt in range(max_tries):
                     try:
                         raw = await self._relay_payload_h1(payload)
-                        chunk_status, chunk_headers, chunk_body = self._split_raw_response(raw)
-                        err = self._validate_range_response(
+                        chunk_status, chunk_headers, chunk_body = split_raw_response(raw)
+                        err = validate_range_response(
                             chunk_status, chunk_headers, chunk_body,
                             s, e, total_size,
                         )
@@ -1483,7 +1666,7 @@ class DomainFronter:
                                     speed_bps = completed_bytes / elapsed
                                     log.info(
                                         "Parallel download progress: %s [%d/%d chunks]",
-                                        self._progress_line(
+                                        progress_line(
                                             elapsed=elapsed,
                                             done=completed_bytes,
                                             total=total_bytes,
@@ -1515,14 +1698,14 @@ class DomainFronter:
         for i, r in enumerate(results):
             if isinstance(r, Exception):
                 log.error("Range chunk %d failed: %s", i, r)
-                return self._error_response(502, f"Parallel download failed: {r}")
+                return error_response(502, f"Parallel download failed: {r}")
             parts.append(r)
 
         full_body = b"".join(parts)
         kbs = (len(full_body) / 1024) / elapsed if elapsed > 0 else 0
         log.info(
             "Parallel download complete: %s",
-            self._progress_line(
+            progress_line(
                 elapsed=elapsed,
                 done=len(full_body),
                 total=len(full_body),
@@ -1557,7 +1740,7 @@ class DomainFronter:
         """
         first_resp = await self._range_probe(url, headers, 0, chunk_size - 1)
 
-        status, resp_hdrs, resp_body = self._split_raw_response(first_resp)
+        status, resp_hdrs, resp_body = split_raw_response(first_resp)
         if status != 206:
             log.info(
                 "Streaming download fallback: initial probe returned %s for %s",
@@ -1565,7 +1748,7 @@ class DomainFronter:
             )
             return False
 
-        parsed_range = self._parse_content_range(resp_hdrs.get("content-range", ""))
+        parsed_range = parse_content_range(resp_hdrs.get("content-range", ""))
         if not parsed_range:
             log.info(
                 "Streaming download fallback: missing/invalid Content-Range for %s",
@@ -1573,7 +1756,7 @@ class DomainFronter:
             )
             return False
         first_start, first_end, total_size = parsed_range
-        first_err = self._validate_range_response(
+        first_err = validate_range_response(
             status, resp_hdrs, resp_body, first_start, first_end, total_size,
         )
         if first_start != 0 or first_err:
@@ -1642,7 +1825,7 @@ class DomainFronter:
             speed_bps = delivered_bytes / elapsed
             log.info(
                 "Parallel download progress: %s [%d/%d chunks]",
-                self._progress_line(
+                progress_line(
                     elapsed=elapsed,
                     done=delivered_bytes,
                     total=total_size,
@@ -1666,15 +1849,15 @@ class DomainFronter:
                             return
                         try:
                             raw = await self._relay_payload_h1(payload)
-                            chunk_status, chunk_headers, chunk_body = self._split_raw_response(raw)
-                            err = self._validate_range_response(
+                            chunk_status, chunk_headers, chunk_body = split_raw_response(raw)
+                            err = validate_range_response(
                                 chunk_status, chunk_headers, chunk_body,
                                 start_off, end_off, total_size,
                             )
                             if err is None:
                                 async with file_lock:
                                     await asyncio.to_thread(
-                                        self._spool_write, temp_file, start_off, chunk_body,
+                                        spool_write, temp_file, start_off, chunk_body,
                                     )
                                 ready[index].set()
                                 return
@@ -1708,7 +1891,7 @@ class DomainFronter:
                 expected = end_off - start_off + 1
                 async with file_lock:
                     chunk = await asyncio.to_thread(
-                        self._spool_read, temp_file, start_off, expected,
+                        spool_read, temp_file, start_off, expected,
                     )
                 if len(chunk) != expected:
                     raise RuntimeError(
@@ -1724,7 +1907,7 @@ class DomainFronter:
             elapsed = max(0.001, time.perf_counter() - t0)
             log.info(
                 "Parallel streaming download complete: %s",
-                self._progress_line(
+                progress_line(
                     elapsed=elapsed,
                     done=total_size,
                     total=total_size,
@@ -1803,6 +1986,72 @@ class DomainFronter:
         "proxy-connection",
     })
 
+    @staticmethod
+    def _strip_sabr_quality_tracks(body: bytes) -> bytes:
+        """Strip field-3 (quality-track selection) entries from a SABR protobuf.
+
+        SABR videoplayback POST bodies may contain field-3 (tag byte 0x1a,
+        wire-type 2) entries that select multiple simultaneous quality tracks.
+        The combined multi-track response easily exceeds Apps Script
+        UrlFetchApp's ~10 MB response buffer.  Removing these top-level
+        field-3 entries forces a single-track response within the limit.
+
+        Only top-level fields are inspected; nested messages are left intact.
+        If any unrecognised wire type is encountered the remainder of the
+        buffer is copied verbatim so a malformed body is never silently lost.
+        """
+        out = bytearray()
+        i = 0
+        n = len(body)
+        while i < n:
+            seg_start = i
+            # ── decode varint tag ───────────────────────────────────
+            tag = 0
+            shift = 0
+            while i < n:
+                b = body[i]; i += 1
+                tag |= (b & 0x7F) << shift
+                shift += 7
+                if not (b & 0x80):
+                    break
+            else:
+                # truncated tag byte — copy remainder verbatim
+                out.extend(body[seg_start:])
+                break
+
+            field_number = tag >> 3
+            wire_type    = tag & 0x07
+
+            # ── advance i past the field value ─────────────────────
+            if wire_type == 0:          # varint
+                while i < n and (body[i] & 0x80):
+                    i += 1
+                if i < n:
+                    i += 1
+            elif wire_type == 1:        # 64-bit fixed
+                i = min(i + 8, n)
+            elif wire_type == 2:        # length-delimited
+                val_len = 0
+                shift = 0
+                while i < n:
+                    b = body[i]; i += 1
+                    val_len |= (b & 0x7F) << shift
+                    shift += 7
+                    if not (b & 0x80):
+                        break
+                i = min(i + val_len, n)
+            elif wire_type == 5:        # 32-bit fixed
+                i = min(i + 4, n)
+            else:
+                # unknown wire type — cannot safely skip; copy rest verbatim
+                out.extend(body[seg_start:])
+                break
+
+            if field_number != 3:
+                out.extend(body[seg_start:i])
+
+        return bytes(out)
+
     def _build_payload(self, method, url, headers, body):
         """Build the JSON relay payload dict."""
         payload = {
@@ -1814,9 +2063,13 @@ class DomainFronter:
         if headers:
             # Strip headers that would leak the user's real IP or expose
             # internal proxy metadata to the upstream destination server.
+            # IMPORTANT: always use the filtered dict — never fall back to
+            # the original headers even when filt is empty, because that would
+            # re-send the very IP-leak headers we just stripped.
             filt = {k: v for k, v in headers.items()
                     if k.lower() not in self._STRIP_HEADERS}
-            payload["h"] = filt if filt else headers
+            if filt:
+                payload["h"] = filt
         if body:
             payload["b"] = base64.b64encode(body).decode()
             ct = headers.get("Content-Type") or headers.get("content-type")
@@ -1827,7 +2080,8 @@ class DomainFronter:
     @classmethod
     def _is_static_asset_url(cls, url: str) -> bool:
         path = urlparse(url).path.lower()
-        return any(path.endswith(ext) for ext in cls._STATIC_EXTS)
+        # Also match versioned paths like /script.js/v3a4b… or /font.woff2/hash
+        return any(path.endswith(ext) or f"{ext}/" in path for ext in cls._STATIC_EXTS)
 
     @staticmethod
     def _header_value(headers: dict | None, name: str) -> str:
@@ -1845,20 +2099,35 @@ class DomainFronter:
         if method not in {"GET", "HEAD"} or body:
             return True
 
-        if headers:
-            for name in STATEFUL_HEADER_NAMES:
+        # Static assets are safe to batch in parallel as independent requests.
+        is_static = cls._is_static_asset_url(url)
+
+        if headers and not is_static:
+            # Static assets (.css, .js, .woff2, .png, …) are served the same
+            # regardless of cookies — browsers always attach cookies but the
+            # server doesn't vary static responses on them.  Only apply
+            # header-based stateful checks to non-static URLs.
+            for name in ("cookie", "authorization", "proxy-authorization"):
                 if cls._header_value(headers, name):
                     return True
 
             accept = cls._header_value(headers, "accept").lower()
-            if "text/html" in accept or "application/json" in accept:
+            if "text/html" in accept:
                 return True
 
             fetch_mode = cls._header_value(headers, "sec-fetch-mode").lower()
-            if fetch_mode in {"navigate", "cors"}:
+            if fetch_mode == "navigate":
                 return True
 
-        return not cls._is_static_asset_url(url)
+            fetch_dest = cls._header_value(headers, "sec-fetch-dest").lower()
+            if fetch_dest in {"document", "iframe", "frame"}:
+                return True
+
+            # Non-static JSON/API calls are treated as stateful by default.
+            if "application/json" in accept:
+                return True
+
+        return not is_static
 
     # ── Batch collector ───────────────────────────────────────────
 
@@ -1867,7 +2136,8 @@ class DomainFronter:
         # If batching is disabled, retry enabling it after a cooldown.
         if not self._batch_enabled:
             if (
-                self._batch_disabled_at > 0
+                not self._batch_permanent_disable
+                and self._batch_disabled_at > 0
                 and (time.time() - self._batch_disabled_at) >= self._batch_cooldown
             ):
                 self._batch_enabled = True
@@ -1898,10 +2168,10 @@ class DomainFronter:
         return await future
 
     async def _batch_timer(self):
-        """Two-tier batch window: 5ms micro + 45ms macro.
+        """Two-tier batch window: 15ms micro + 120ms macro.
 
-        Single requests (link clicks) get only 5ms delay.
-        Burst traffic (page sub-resources, range chunks) gets a 50ms
+        Single requests (link clicks) get only 15ms delay.
+        Burst traffic (page sub-resources, range chunks) gets a 120ms
         window to accumulate, enabling much larger batches.
         """
         # Tier 1: micro-window — detect if burst or single
@@ -1925,8 +2195,78 @@ class DomainFronter:
                 self._batch_task = None
                 self._spawn(self._batch_send(batch))
 
+    @staticmethod
+    def _split_list(lst: list, n: int) -> list[list]:
+        """Split lst into n roughly-equal contiguous chunks (no empty chunks)."""
+        n = min(n, len(lst))
+        k, rem = divmod(len(lst), n)
+        chunks, start = [], 0
+        for i in range(n):
+            size = k + (1 if i < rem else 0)
+            chunks.append(lst[start:start + size])
+            start += size
+        return chunks
+
+    @staticmethod
+    def _url_ext(url: str) -> str:
+        """Extract the lowercase file extension from a URL path (no query)."""
+        try:
+            path = urlparse(url).path
+            if "." in path:
+                return path.rsplit(".", 1)[-1].lower()
+        except Exception:
+            pass
+        return ""
+
+    def _make_sub_batches(self, batch: list, n_connections: int) -> list[list]:
+        """Build sub-batches that isolate heavy (binary) from light requests.
+
+        A 2 kB CSS file and a 400 kB font batched together mean the CSS
+        future doesn't resolve until the font finishes downloading at 40 KB/s
+        (~15s).  By separating heavy files onto their own H2 connection the
+        light files resolve in <1s and the browser can continue rendering
+        while the large binaries transfer in parallel.
+        """
+        if n_connections <= 1:
+            return [batch]
+
+        heavy, light = [], []
+        for item in batch:
+            url = item[0].get("u", "")
+            ext = self._url_ext(url)
+            (heavy if ext in self._HEAVY_EXTENSIONS else light).append(item)
+
+        if not heavy:
+            # All light items (CSS, JS, JSON…) — keep as a single batch.
+            # Each sub-batch is one Apps Script execution; splitting N small
+            # files into N executions wastes N× quota with negligible DPI
+            # benefit (small payloads clear the token bucket quickly anyway).
+            return [batch]
+        if not light:
+            # All heavy items — split across connections so each large file
+            # gets its own DPI token bucket (parallel throughput).
+            return self._split_list(batch, min(n_connections, len(batch)))
+
+        # Reserve n_connections-1 slots for heavy items (each gets its own
+        # throughput budget); give the remaining slot(s) to light items.
+        n_heavy_slots = min(n_connections - 1, len(heavy))
+        sub_batches = self._split_list(heavy, n_heavy_slots)
+        n_light_slots = n_connections - len(sub_batches)
+        if n_light_slots > 1 and len(light) >= n_light_slots:
+            sub_batches += self._split_list(light, n_light_slots)
+        else:
+            sub_batches.append(light)
+        return [s for s in sub_batches if s]
+
     async def _batch_send(self, batch: list):
-        """Send a batch of requests. Uses fetchAll for multi, single for one."""
+        """Send a batch of requests, split across H2 connections for parallel throughput.
+
+        Iran's DPI shapes per-TCP-connection.  A 600 kB response over one
+        connection at 40 KB/s takes ~15s.  Splitting the same batch across 3
+        connections means each carries ~200 kB → ~5s, all in parallel → 3×
+        faster wall-clock.  Each sub-batch is an independent Apps Script
+        fetchAll call on a separate H2 transport.
+        """
         if len(batch) == 1:
             payload, future = batch[0]
             try:
@@ -1935,27 +2275,87 @@ class DomainFronter:
                     future.set_result(result)
             except Exception as e:
                 if not future.done():
-                    future.set_result(self._error_response(502, str(e)))
-        else:
-            log.info("Batch relay: %d requests", len(batch))
-            try:
-                results = await self._relay_batch([p for p, _ in batch])
-                for (_, future), result in zip(batch, results):
-                    if not future.done():
-                        future.set_result(result)
-            except Exception as e:
-                log.warning(
-                    "Batch relay failed, disabling batch mode for %ds cooldown. "
-                    "Error: %s",
-                    self._batch_cooldown, e,
-                )
-                self._batch_enabled = False
-                self._batch_disabled_at = time.time()
-                # Fallback: send individually
-                tasks = []
-                for payload, future in batch:
-                    tasks.append(self._relay_fallback(payload, future))
-                await asyncio.gather(*tasks)
+                    future.set_result(error_response(502, str(e)))
+            return
+
+        # Determine how many live H2 connections to split across.
+        n_live = (
+            sum(1 for t in self._h2_pool if t.is_connected)
+            if self._h2_pool else 0
+        )
+        n_splits = min(n_live, len(batch)) if (n_live > 1 and self._sub_batch_enabled) else 1
+
+        if n_splits > 1:
+            # Build size-aware sub-batches: heavy files (fonts, images) get
+            # their own H2 connection so light files don't wait for them.
+            chunks = self._make_sub_batches(batch, n_splits)
+
+            heavy_count = sum(
+                1 for p, _ in batch
+                if self._url_ext(p.get("u", "")) in self._HEAVY_EXTENSIONS
+            )
+            log.info(
+                "Batch relay: %d requests (%d heavy+%d light) → %d sub-batches (%s)",
+                len(batch), heavy_count, len(batch) - heavy_count,
+                len(chunks), "+".join(str(len(c)) for c in chunks),
+            )
+
+            # Wrap each sub-batch relay with timing so slow connections are
+            # logged and we can correlate them with DPI shaping events.
+            async def _timed_sub_batch(items: list):
+                t0 = time.perf_counter()
+                result = await self._relay_batch([p for p, _ in items])
+                return result, time.perf_counter() - t0
+
+            chunk_results = await asyncio.gather(
+                *[_timed_sub_batch(c) for c in chunks],
+                return_exceptions=True,
+            )
+
+            max_dt = 0.0
+            for chunk, result in zip(chunks, chunk_results):
+                if isinstance(result, Exception):
+                    log.warning(
+                        "Sub-batch failed (%s: %s), retrying individually",
+                        type(result).__name__, result,
+                    )
+                    for payload, future in chunk:
+                        self._spawn(self._relay_fallback(payload, future))
+                else:
+                    items_result, dt = result
+                    max_dt = max(max_dt, dt)
+                    if dt > 8.0:
+                        log.warning(
+                            "Slow sub-batch: %.1fs for %d items — DPI shaping?",
+                            dt, len(chunk),
+                        )
+                    for (_, future), raw in zip(chunk, items_result):
+                        if not future.done():
+                            future.set_result(raw)
+            if max_dt > 0:
+                log.debug("Batch wall-clock: %.1fs", max_dt)
+            return
+
+        # Single-batch path: H2 unavailable or only one connection live.
+        log.info("Batch relay: %d requests", len(batch))
+        try:
+            results = await self._relay_batch([p for p, _ in batch])
+            for (_, future), result in zip(batch, results):
+                if not future.done():
+                    future.set_result(result)
+        except Exception as e:
+            log.warning(
+                "Batch relay failed, disabling batch mode for %ds cooldown. "
+                "Error: %s: %s",
+                self._batch_cooldown, type(e).__name__, e or "(no details)",
+            )
+            self._batch_enabled = False
+            self._batch_disabled_at = time.time()
+            # Fallback: send individually
+            tasks = []
+            for payload, future in batch:
+                tasks.append(self._relay_fallback(payload, future))
+            await asyncio.gather(*tasks)
 
     async def _relay_fallback(self, payload, future):
         """Fallback: relay a single request from a failed batch."""
@@ -1965,7 +2365,7 @@ class DomainFronter:
                 future.set_result(result)
         except Exception as e:
             if not future.done():
-                future.set_result(self._error_response(502, str(e)))
+                future.set_result(error_response(502, str(e)))
 
     # ── Core relay with retry ─────────────────────────────────────
 
@@ -1986,7 +2386,9 @@ class DomainFronter:
                 self._record_h2_success()
                 return result
             except Exception as e:
-                self._record_h2_failure(e)
+                if self._is_h2_transport_error(e):
+                    self._record_h2_failure(e)
+                    self._spawn(self._reconnect_pool_members())
                 log.debug("Fan-out relay failed (%s), falling back", e)
                 # fall through to single-path logic below
 
@@ -2000,24 +2402,20 @@ class DomainFronter:
                     self._record_h2_success()
                     return result
                 except Exception as e:
-                    self._record_h2_failure(e)
-                    if attempt < attempts - 1:
-                        log.debug("H2 relay failed (%s), reconnecting", e)
-                        try:
-                            await self._h2.reconnect()
-                            # Do NOT record success here — only a successful relay
-                            # response proves the connection works.  Recording
-                            # success after reconnect was resetting the failure
-                            # streak and causing an infinite reconnect storm.
-                        except Exception as reconnect_exc:
-                            self._record_h2_failure(reconnect_exc)
-                            log.warning("H2 reconnect failed, falling back to H1")
-                            break
+                    is_transport = self._is_h2_transport_error(e)
+                    if is_transport:
+                        self._record_h2_failure(e)
+                        # Spawn background reconnect for any newly-dead transports
+                        # so future requests find healthy connections.
+                        self._spawn(self._reconnect_pool_members())
+                    if attempt < attempts - 1 and self._h2_available():
+                        log.debug("H2 relay attempt %d failed (%s: %s), retrying",
+                                  attempt + 1, type(e).__name__, e)
                     else:
-                        # Last H2 attempt failed — fall through to H1 rather
-                        # than raising here, which would bypass H1 entirely.
-                        log.debug("H2 relay failed on final attempt (%s), "
-                                  "falling back to H1", e)
+                        log.debug(
+                            "H2 relay failed (%s: %s), falling back to H1",
+                            type(e).__name__, e,
+                        )
                         break
 
         # HTTP/1.1 fallback (pool-based)
@@ -2086,22 +2484,24 @@ class DomainFronter:
     async def _relay_single_h2(self, payload: dict) -> bytes:
         """Execute a relay through HTTP/2 multiplexing.
 
-        Uses the shared H2 connection — no pool checkout needed.
-        Many concurrent calls all share one TLS connection.
+        Picks a connection from the pool via round-robin so each request
+        benefits from its own DPI token bucket.
         """
         full_payload = dict(payload)
         full_payload["k"] = self.auth_key
         json_body = json.dumps(full_payload).encode()
 
-        path = self._exec_path(payload.get("u"))
+        sid = self._script_id_for_key(self._host_key(payload.get("u")))
+        path = self._exec_path_for_sid(sid)
+        self._record_execution(sid)
 
-        status, headers, body = await self._h2.request(
+        status, headers, body = await (self._pick_h2() or self._h2).request(
             method="POST", path=path, host=self.http_host,
             headers={"content-type": "application/json"},
             body=json_body,
         )
 
-        return self._parse_relay_response(body)
+        return parse_relay_response(body, self._max_response_body_bytes)
 
     async def _relay_single_h2_with_sid(self, payload: dict,
                                         sid: str) -> bytes:
@@ -2115,14 +2515,59 @@ class DomainFronter:
         json_body = json.dumps(full_payload).encode()
 
         path = self._exec_path_for_sid(sid)
+        self._record_execution(sid)
 
-        status, headers, body = await self._h2.request(
+        status, headers, body = await (self._pick_h2() or self._h2).request(
             method="POST", path=path, host=self.http_host,
             headers={"content-type": "application/json"},
             body=json_body,
         )
 
-        return self._parse_relay_response(body)
+        return parse_relay_response(body, self._max_response_body_bytes)
+
+    async def _follow_redirects(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        status: int,
+        resp_headers: dict,
+        resp_body: bytes,
+        original_body: bytes,
+    ) -> tuple[int, dict, bytes]:
+        """Follow up to 5 HTTP redirects on an existing H1 connection.
+
+        307/308 preserve the request method and body; all others become
+        GET with an empty body (RFC 7231 §6.4).
+        """
+        for _ in range(5):
+            if status not in (301, 302, 303, 307, 308):
+                break
+            location = resp_headers.get("location")
+            if not location:
+                break
+            parsed = urlparse(location)
+            rpath = parsed.path + ("?" + parsed.query if parsed.query else "")
+            if status in (307, 308):
+                redirect_method = "POST"
+                redirect_body = original_body
+            else:
+                redirect_method = "GET"
+                redirect_body = b""
+            request_lines = [
+                f"{redirect_method} {rpath} HTTP/1.1",
+                f"Host: {parsed.netloc}",
+                "Accept-Encoding: gzip",
+                "Connection: keep-alive",
+            ]
+            if redirect_body:
+                request_lines.append(f"Content-Length: {len(redirect_body)}")
+            request = "\r\n".join(request_lines) + "\r\n\r\n"
+            writer.write(request.encode() + redirect_body)
+            await writer.drain()
+            status, resp_headers, resp_body = await read_http_response(
+                reader, max_bytes=self._max_response_body_bytes
+            )
+        return status, resp_headers, resp_body
 
     async def _relay_single(self, payload: dict) -> bytes:
         """Execute a single relay POST → redirect → parse."""
@@ -2131,7 +2576,8 @@ class DomainFronter:
         full_payload["k"] = self.auth_key
         json_body = json.dumps(full_payload).encode()
 
-        path = self._exec_path(payload.get("u"))
+        sid = self._script_id_for_key(self._host_key(payload.get("u")))
+        path = self._exec_path_for_sid(sid)
         reader, writer, created = await self._acquire()
 
         try:
@@ -2146,40 +2592,17 @@ class DomainFronter:
             )
             writer.write(request.encode() + json_body)
             await writer.drain()
+            self._record_execution(sid)
 
-            status, resp_headers, resp_body = await self._read_http_response(reader)
-
-            # Follow redirect chain on the SAME connection
-            for _ in range(5):
-                if status not in (301, 302, 303, 307, 308):
-                    break
-                location = resp_headers.get("location")
-                if not location:
-                    break
-
-                parsed = urlparse(location)
-                rpath = parsed.path + ("?" + parsed.query if parsed.query else "")
-                if status in (307, 308):
-                    redirect_method = "POST"
-                    redirect_body = json_body
-                else:
-                    redirect_method = "GET"
-                    redirect_body = b""
-                request_lines = [
-                    f"{redirect_method} {rpath} HTTP/1.1",
-                    f"Host: {parsed.netloc}",
-                    "Accept-Encoding: gzip",
-                    "Connection: keep-alive",
-                ]
-                if redirect_body:
-                    request_lines.append(f"Content-Length: {len(redirect_body)}")
-                request = "\r\n".join(request_lines) + "\r\n\r\n"
-                writer.write(request.encode() + redirect_body)
-                await writer.drain()
-                status, resp_headers, resp_body = await self._read_http_response(reader)
+            status, resp_headers, resp_body = await read_http_response(
+                reader, max_bytes=self._max_response_body_bytes
+            )
+            status, resp_headers, resp_body = await self._follow_redirects(
+                reader, writer, status, resp_headers, resp_body, json_body
+            )
 
             await self._release(reader, writer, created)
-            return self._parse_relay_response(resp_body)
+            return parse_relay_response(resp_body, self._max_response_body_bytes)
 
         except Exception:
             try:
@@ -2195,13 +2618,17 @@ class DomainFronter:
             "q": payloads,
         }
         json_body = json.dumps(batch_payload).encode()
-        path = self._exec_path(payloads[0].get("u") if payloads else None)
+        sid = self._script_id_for_key(
+            self._host_key(payloads[0].get("u") if payloads else None)
+        )
+        path = self._exec_path_for_sid(sid)
 
         # Try HTTP/2 first
         if self._h2_available():
             try:
+                self._record_execution(sid)
                 status, headers, body = await asyncio.wait_for(
-                    self._h2.request(
+                    (self._pick_h2() or self._h2).request(
                         method="POST", path=path, host=self.http_host,
                         headers={"content-type": "application/json"},
                         body=json_body,
@@ -2211,7 +2638,9 @@ class DomainFronter:
                 self._record_h2_success()
                 return self._parse_batch_body(body, payloads)
             except Exception as e:
-                self._record_h2_failure(e)
+                if self._is_h2_transport_error(e):
+                    self._record_h2_failure(e)
+                    self._spawn(self._reconnect_pool_members())
                 log.debug("H2 batch failed (%s), falling back to H1", e)
 
         # HTTP/1.1 fallback
@@ -2229,36 +2658,14 @@ class DomainFronter:
                 )
                 writer.write(request.encode() + json_body)
                 await writer.drain()
+                self._record_execution(sid)
 
-                status, resp_headers, resp_body = await self._read_http_response(reader)
-
-                # Follow redirects
-                for _ in range(5):
-                    if status not in (301, 302, 303, 307, 308):
-                        break
-                    location = resp_headers.get("location")
-                    if not location:
-                        break
-                    parsed = urlparse(location)
-                    rpath = parsed.path + ("?" + parsed.query if parsed.query else "")
-                    if status in (307, 308):
-                        redirect_method = "POST"
-                        redirect_body = json_body
-                    else:
-                        redirect_method = "GET"
-                        redirect_body = b""
-                    request_lines = [
-                        f"{redirect_method} {rpath} HTTP/1.1",
-                        f"Host: {parsed.netloc}",
-                        "Accept-Encoding: gzip",
-                        "Connection: keep-alive",
-                    ]
-                    if redirect_body:
-                        request_lines.append(f"Content-Length: {len(redirect_body)}")
-                    request = "\r\n".join(request_lines) + "\r\n\r\n"
-                    writer.write(request.encode() + redirect_body)
-                    await writer.drain()
-                    status, resp_headers, resp_body = await self._read_http_response(reader)
+                status, resp_headers, resp_body = await read_http_response(
+                    reader, max_bytes=self._max_response_body_bytes
+                )
+                status, resp_headers, resp_body = await self._follow_redirects(
+                    reader, writer, status, resp_headers, resp_body, json_body
+                )
 
                 await self._release(reader, writer, created)
 
@@ -2275,14 +2682,9 @@ class DomainFronter:
                           payloads: list[dict]) -> list[bytes]:
         """Parse a batch response body into individual results."""
         text = resp_body.decode(errors="replace").strip()
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r'\{.*\}', text, re.DOTALL)
-            try:
-                data = json.loads(m.group()) if m else None
-            except json.JSONDecodeError:
-                data = None
+        # Apps Script can wrap JSON inside an HTML shell; reuse the same
+        # robust loader used by single-response parsing.
+        data = load_relay_json(text)
         if not data:
             raise RuntimeError(f"Bad batch response: {text[:200]}")
 
@@ -2297,394 +2699,6 @@ class DomainFronter:
 
         results = []
         for item in items:
-            results.append(self._parse_relay_json(item))
+            results.append(parse_relay_json(item, self._max_response_body_bytes))
         return results
 
-    # ── HTTP response reading (keep-alive safe) ──────────────────
-
-    async def _read_http_response(self, reader: asyncio.StreamReader):
-        """Read one HTTP response. Keep-alive safe (no read-until-EOF)."""
-        raw = b""
-        while b"\r\n\r\n" not in raw:
-            if len(raw) > 65536:  # 64 KB header size limit
-                return 0, {}, b""
-            chunk = await asyncio.wait_for(reader.read(8192), timeout=8)
-            if not chunk:
-                break
-            raw += chunk
-
-        if b"\r\n\r\n" not in raw:
-            return 0, {}, b""
-
-        header_section, body = raw.split(b"\r\n\r\n", 1)
-        lines = header_section.split(b"\r\n")
-
-        status_line = lines[0].decode(errors="replace")
-        m = re.search(r"\d{3}", status_line)
-        status = int(m.group()) if m else 0
-
-        headers = {}
-        for line in lines[1:]:
-            if b":" in line:
-                k, v = line.decode(errors="replace").split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-
-        content_length = headers.get("content-length")
-        transfer_encoding = headers.get("transfer-encoding", "")
-
-        if "chunked" in transfer_encoding:
-            body = await self._read_chunked(reader, body)
-        elif content_length:
-            total = int(content_length)
-            if total > self._max_response_body_bytes:
-                raise RuntimeError(
-                    "Relay response exceeds configured size cap "
-                    f"({total} > {self._max_response_body_bytes} bytes)"
-                )
-            remaining = total - len(body)
-            while remaining > 0:
-                chunk = await asyncio.wait_for(
-                    reader.read(min(remaining, 65536)), timeout=20
-                )
-                if not chunk:
-                    break
-                body += chunk
-                if len(body) > self._max_response_body_bytes:
-                    raise RuntimeError(
-                        "Relay response exceeded configured size cap while reading body"
-                    )
-                remaining -= len(chunk)
-        else:
-            # No framing — short timeout read (keep-alive safe)
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(reader.read(65536), timeout=2)
-                    if not chunk:
-                        break
-                    body += chunk
-                    if len(body) > self._max_response_body_bytes:
-                        raise RuntimeError(
-                            "Relay response exceeded configured size cap while streaming"
-                        )
-                except asyncio.TimeoutError:
-                    break
-
-        # Auto-decompress (gzip/deflate/br/zstd) from Google frontend
-        enc = headers.get("content-encoding", "")
-        if enc:
-            body = codec.decode(body, enc)
-            if len(body) > self._max_response_body_bytes:
-                raise RuntimeError(
-                    "Decoded relay response exceeded configured size cap"
-                )
-
-        return status, headers, body
-
-    async def _read_chunked(self, reader, buf=b""):
-        """Incrementally read chunked transfer-encoding."""
-        result = b""
-        max_body = self._max_response_body_bytes
-        while True:
-            while b"\r\n" not in buf:
-                data = await asyncio.wait_for(reader.read(8192), timeout=20)
-                if not data:
-                    return result
-                buf += data
-
-            end = buf.find(b"\r\n")
-            size_str = buf[:end].decode(errors="replace").strip()
-            buf = buf[end + 2:]
-
-            if not size_str:
-                continue
-            try:
-                size = int(size_str, 16)
-            except ValueError:
-                break
-            if size == 0:
-                break
-            if size > max_body or len(result) + size > max_body:
-                raise RuntimeError(
-                    "Chunked relay response exceeded configured size cap "
-                    f"({max_body} bytes)"
-                )
-
-            while len(buf) < size + 2:
-                data = await asyncio.wait_for(reader.read(65536), timeout=20)
-                if not data:
-                    result += buf[:size]
-                    return result
-                buf += data
-
-            result += buf[:size]
-            buf = buf[size + 2:]
-
-        return result
-
-    # ── Response parsing ──────────────────────────────────────────
-
-    def _parse_relay_response(self, body: bytes) -> bytes:
-        """Parse JSON from Apps Script and reconstruct an HTTP response."""
-        text = body.decode(errors="replace").strip()
-        if not text:
-            return self._error_response(502, "Empty response from relay")
-
-        data = self._load_relay_json(text)
-        if data is None:
-            return self._error_response(502, f"No JSON: {text[:200]}")
-
-        return self._parse_relay_json(data)
-
-    @staticmethod
-    def _load_relay_json(text: str) -> dict | None:
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            wrapped = DomainFronter._extract_apps_script_user_html(text)
-            if wrapped:
-                data = DomainFronter._load_relay_json(wrapped)
-                if data is not None:
-                    return data
-
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if not match:
-                return None
-            try:
-                data = json.loads(match.group())
-            except json.JSONDecodeError:
-                return None
-            return data if isinstance(data, dict) else None
-
-    @staticmethod
-    def _extract_apps_script_user_html(text: str) -> str | None:
-        marker = 'goog.script.init("'
-        start = text.find(marker)
-        if start == -1:
-            return None
-        start += len(marker)
-        end = text.find('", "", undefined', start)
-        if end == -1:
-            return None
-
-        encoded = text[start:end]
-        try:
-            decoded = codecs.decode(encoded, "unicode_escape")
-            payload = json.loads(decoded)
-        except Exception:
-            return None
-
-        user_html = payload.get("userHtml")
-        return user_html if isinstance(user_html, str) else None
-
-    # ── Apps Script error classifier ─────────────────────────────
-    # Patterns are matched against the lower-cased raw error string from
-    # Apps Script's `e` field.  Sources:
-    #   • https://developers.google.com/apps-script/guides/support/troubleshooting
-    #   • https://developers.google.com/apps-script/guides/services/quotas
-    #   • Google Issue Tracker (urlfetch / bandwidth quota issues)
-
-    # "Service invoked too many times for one day: urlfetch."
-    # "Bandwidth quota exceeded"
-    # "UrlFetch failed because too much upload bandwidth was used"
-    # "UrlFetch failed because too much traffic is being sent to the specified URL"
-    _QUOTA_PATTERNS = (
-        "service invoked too many times",
-        "invoked too many times",
-        "bandwidth quota exceeded",
-        "too much upload bandwidth",
-        "too much traffic",
-        "urlfetch",   # appears at end of the daily-quota message in all locales
-        "quota",
-        "exceeded",
-        "daily",
-        "rate limit",
-    )
-
-    # "Authorization is required to perform that action."
-    # "unauthorized"  (our own Code.gs response)
-    # "Access denied"
-    # "Permission denied"
-    _AUTH_PATTERNS = (
-        "authorization is required",
-        "unauthorized",
-        "not authorized",
-        "permission denied",
-        "access denied",
-    )
-
-    # "Error occurred due to a missing library version or a deployment version.
-    #  Error code Not_Found"
-    # "script id not found" / wrong Deployment ID
-    _DEPLOY_PATTERNS = (
-        "error code not_found",
-        "not_found",
-        "deployment",
-        "script id",
-        "scriptid",
-        "no script",
-    )
-
-    # "Server not available." / "Server error occurred, please try again."
-    _TRANSIENT_PATTERNS = (
-        "server not available",
-        "server error occurred",
-        "please try again",
-        "temporarily unavailable",
-    )
-
-    # "UrlFetch calls to <URL> are not permitted by your admin"
-    # "<Class> / Apiary.<Service> is disabled. Please contact your administrator"
-    _ADMIN_PATTERNS = (
-        "not permitted by your admin",
-        "contact your administrator",
-        "disabled. please contact",
-        "domain policy has disabled",
-        "administrator to enable",
-    )
-
-    @classmethod
-    def _classify_relay_error(cls, raw: str) -> str:
-        """Return a human-readable explanation for a known Apps Script error.
-
-        Covers every error category documented at:
-        developers.google.com/apps-script/guides/support/troubleshooting
-        """
-        lower = raw.lower()
-
-        if any(p in lower for p in cls._QUOTA_PATTERNS):
-            return (
-                "Apps Script quota exhausted. "
-                "Either the 20,000 URL-fetch calls/day limit or the 100 MB/day "
-                "bandwidth limit has been reached. "
-                "Wait up to 24 hours for the quota to reset, or create a second "
-                "Google account, deploy a fresh Apps Script there, and add its "
-                "script_id to config.json."
-            )
-
-        if any(p in lower for p in cls._AUTH_PATTERNS):
-            return (
-                "Apps Script rejected the request (auth/permission error). "
-                "Check: (1) AUTH_KEY in Code.gs matches 'auth_key' in config.json, "
-                "(2) the deployment is set to 'Execute as: Me / Anyone can access', "
-                "(3) you are using the Deployment ID (not the Script ID), "
-                "(4) the owning Google account has authorised the script by running "
-                "it manually at least once."
-            )
-
-        if any(p in lower for p in cls._DEPLOY_PATTERNS):
-            return (
-                "Apps Script deployment not found. "
-                "Verify 'script_id' in config.json is the Deployment ID "
-                "(not the Script ID), the deployment is active/not archived, "
-                "and you re-created the deployment after editing Code.gs."
-            )
-
-        if any(p in lower for p in cls._TRANSIENT_PATTERNS):
-            return (
-                "Google Apps Script server is temporarily unavailable. "
-                "This is a transient Google-side error — wait a moment and retry. "
-                f"(raw: {raw})"
-            )
-
-        if any(p in lower for p in cls._ADMIN_PATTERNS):
-            return (
-                "Apps Script is blocked by a Google Workspace admin policy. "
-                "Either the target URL is not on the admin's UrlFetch allowlist, "
-                "or a Google service used by the script has been disabled by the "
-                "domain administrator. Contact your Google Workspace admin. "
-                f"(raw: {raw})"
-            )
-
-        # Unknown — strip the leading 'Exception: ' / 'Error: ' prefix that
-        # Apps Script always prepends, so the message is shorter and cleaner.
-        cleaned = re.sub(r'^(Exception|Error):\s*', '', raw, flags=re.IGNORECASE).strip()
-        return f"Relay error from Apps Script: {cleaned or raw}"
-
-    def _parse_relay_json(self, data: dict) -> bytes:
-        """Convert a parsed relay JSON dict to raw HTTP response bytes."""
-        if "e" in data:
-            raw_err = str(data["e"])
-            friendly = self._classify_relay_error(raw_err)
-            log.warning("Apps Script error — %s | raw: %s", friendly.split(".")[0], raw_err)
-            return self._error_response(502, friendly)
-
-        status = data.get("s", 200)
-        resp_headers = data.get("h", {})
-        resp_body = base64.b64decode(data.get("b", ""))
-        if len(resp_body) > self._max_response_body_bytes:
-            return self._error_response(
-                502,
-                "Relay response exceeds cap "
-                f"({self._max_response_body_bytes} bytes). "
-                "Increase max_response_body_bytes if your system has enough RAM.",
-            )
-
-        status_text = {200: "OK", 206: "Partial Content",
-                       301: "Moved", 302: "Found", 304: "Not Modified",
-                       400: "Bad Request", 403: "Forbidden", 404: "Not Found",
-                       500: "Internal Server Error"}.get(status, "OK")
-        result = f"HTTP/1.1 {status} {status_text}\r\n"
-
-        skip = {"transfer-encoding", "connection", "keep-alive",
-                "content-length", "content-encoding"}
-        for k, v in resp_headers.items():
-            if k.lower() in skip:
-                continue
-            # Apps Script returns multi-valued headers (e.g. Set-Cookie) as a
-            # JavaScript array. Emit each value as its own header line.
-            # A single string that holds multiple Set-Cookie values joined
-            # with ", " also needs to be split, otherwise the browser sees
-            # one malformed cookie and sites like x.com fail.
-            values = v if isinstance(v, list) else [v]
-            if k.lower() == "set-cookie":
-                expanded = []
-                for item in values:
-                    expanded.extend(self._split_set_cookie(str(item)))
-                values = expanded
-            for val in values:
-                result += f"{k}: {val}\r\n"
-        result += f"Content-Length: {len(resp_body)}\r\n"
-        result += "\r\n"
-        return result.encode() + resp_body
-
-    @staticmethod
-    def _split_set_cookie(blob: str) -> list[str]:
-        """Split a Set-Cookie string that may contain multiple cookies.
-
-        Apps Script sometimes joins multiple Set-Cookie values with ", ",
-        which collides with the comma that legitimately appears inside the
-        `Expires` attribute (e.g. "Expires=Wed, 21 Oct 2026 ..."). We split
-        only on commas that are immediately followed by a cookie name=value
-        pair (token '=' ...), leaving date commas intact.
-        """
-        if not blob:
-            return []
-        # Split on ", " but only when the following text looks like the start
-        # of a new cookie (a token followed by '=').
-        parts = re.split(r",\s*(?=[A-Za-z0-9!#$%&'*+\-.^_`|~]+=)", blob)
-        return [p.strip() for p in parts if p.strip()]
-
-    def _split_raw_response(self, raw: bytes):
-        """Split a raw HTTP response into (status, headers_dict, body)."""
-        if b"\r\n\r\n" not in raw:
-            return 0, {}, raw
-        header_section, body = raw.split(b"\r\n\r\n", 1)
-        lines = header_section.split(b"\r\n")
-        m = re.search(r"\d{3}", lines[0].decode(errors="replace"))
-        status = int(m.group()) if m else 0
-        headers = {}
-        for line in lines[1:]:
-            if b":" in line:
-                k, v = line.decode(errors="replace").split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-        return status, headers, body
-
-    def _error_response(self, status: int, message: str) -> bytes:
-        body = f"<html><body><h1>{status}</h1><p>{message}</p></body></html>"
-        return (
-            f"HTTP/1.1 {status} Error\r\n"
-            f"Content-Type: text/html\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            f"\r\n"
-            f"{body}"
-        ).encode()

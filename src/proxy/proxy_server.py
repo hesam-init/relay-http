@@ -13,19 +13,16 @@ import socket
 import ssl
 import time
 import ipaddress
-from urllib.parse import urlparse
 
 try:
     import certifi
 except Exception:  # optional dependency fallback
     certifi = None
 
-from constants import (
+from core.constants import (
     CACHE_MAX_MB,
-    CACHE_TTL_MAX,
-    CACHE_TTL_STATIC_LONG,
-    CACHE_TTL_STATIC_MED,
     CLIENT_IDLE_TIMEOUT,
+    DEFAULT_BYPASS_HOSTS,
     GOOGLE_DIRECT_ALLOW_EXACT,
     GOOGLE_DIRECT_ALLOW_SUFFIXES,
     GOOGLE_DIRECT_EXACT_EXCLUDE,
@@ -36,130 +33,27 @@ from constants import (
     MAX_HEADER_BYTES,
     MAX_REQUEST_BODY_BYTES,
     SNI_REWRITE_SUFFIXES,
-    STATIC_EXTS,
     TCP_CONNECT_TIMEOUT,
     TRACE_HOST_SUFFIXES,
     UNCACHEABLE_HEADER_NAMES,
 )
-from domain_fronter import DomainFronter
+from relay.domain_fronter import DomainFronter
+from .socks5 import negotiate_socks5
+from .proxy_support import (
+    ResponseCache,
+    cors_preflight_response,
+    has_unsupported_transfer_encoding,
+    header_value,
+    host_matches_rules,
+    inject_cors_headers,
+    is_ip_literal,
+    load_host_rules,
+    log_response_summary,
+    parse_content_length,
+)
+from relay.relay_response import split_raw_response
 
 log = logging.getLogger("Proxy")
-
-
-def _is_ip_literal(host: str) -> bool:
-    """True for IPv4/IPv6 literals (strips brackets around IPv6)."""
-    h = host.strip("[]")
-    try:
-        ipaddress.ip_address(h)
-        return True
-    except ValueError:
-        return False
-
-
-def _parse_content_length(header_block: bytes) -> int:
-    """Return Content-Length or 0. Matches only the exact header name."""
-    for raw_line in header_block.split(b"\r\n"):
-        name, sep, value = raw_line.partition(b":")
-        if not sep:
-            continue
-        if name.strip().lower() == b"content-length":
-            try:
-                return int(value.strip())
-            except ValueError:
-                return 0
-    return 0
-
-
-def _has_unsupported_transfer_encoding(header_block: bytes) -> bool:
-    """True when the request uses Transfer-Encoding, which we don't stream."""
-    for raw_line in header_block.split(b"\r\n"):
-        name, sep, value = raw_line.partition(b":")
-        if not sep:
-            continue
-        if name.strip().lower() != b"transfer-encoding":
-            continue
-        encodings = [
-            token.strip().lower()
-            for token in value.decode(errors="replace").split(",")
-            if token.strip()
-        ]
-        return any(token != "identity" for token in encodings)
-    return False
-
-
-class ResponseCache:
-    """Simple LRU response cache — avoids repeated relay calls."""
-
-    def __init__(self, max_mb: int = 50):
-        self._store: dict[str, tuple[bytes, float]] = {}
-        self._size = 0
-        self._max = max_mb * 1024 * 1024
-        self.hits = 0
-        self.misses = 0
-
-    def get(self, url: str) -> bytes | None:
-        entry = self._store.get(url)
-        if not entry:
-            self.misses += 1
-            return None
-        raw, expires = entry
-        if time.time() > expires:
-            self._size -= len(raw)
-            del self._store[url]
-            self.misses += 1
-            return None
-        self.hits += 1
-        return raw
-
-    def put(self, url: str, raw_response: bytes, ttl: int = 300):
-        size = len(raw_response)
-        if size > self._max // 4 or size == 0:
-            return
-        # Evict oldest to make room
-        while self._size + size > self._max and self._store:
-            oldest = next(iter(self._store))
-            self._size -= len(self._store[oldest][0])
-            del self._store[oldest]
-        if url in self._store:
-            self._size -= len(self._store[url][0])
-        self._store[url] = (raw_response, time.time() + ttl)
-        self._size += size
-
-    @staticmethod
-    def parse_ttl(raw_response: bytes, url: str) -> int:
-        """Determine cache TTL from response headers and URL."""
-        hdr_end = raw_response.find(b"\r\n\r\n")
-        if hdr_end < 0:
-            return 0
-        hdr = raw_response[:hdr_end].decode(errors="replace").lower()
-
-        # Don't cache errors or non-200
-        if b"HTTP/1.1 200" not in raw_response[:20]:
-            return 0
-        if "no-store" in hdr or "private" in hdr or "set-cookie:" in hdr:
-            return 0
-
-        # Explicit max-age
-        m = re.search(r"max-age=(\d+)", hdr)
-        if m:
-            return min(int(m.group(1)), CACHE_TTL_MAX)
-
-        # Heuristic by content type / extension
-        path = url.split("?")[0].lower()
-        for ext in STATIC_EXTS:
-            if path.endswith(ext):
-                return CACHE_TTL_STATIC_LONG
-
-        ct_m = re.search(r"content-type:\s*([^\r\n]+)", hdr)
-        ct = ct_m.group(1) if ct_m else ""
-        if "image/" in ct or "font/" in ct:
-            return CACHE_TTL_STATIC_LONG
-        if "text/css" in ct or "javascript" in ct:
-            return CACHE_TTL_STATIC_MED
-        if "text/html" in ct or "application/json" in ct:
-            return 0  # don't cache dynamic content by default
-
-        return 0
 
 
 class ProxyServer:
@@ -180,14 +74,15 @@ class ProxyServer:
 
     def __init__(self, config: dict):
         self.host = config.get("listen_host", "127.0.0.1")
-        self.port = config.get("listen_port", 8080)
-        self.socks_enabled = config.get("socks5_enabled", True)
+        # Prefer the new key (http_port) but keep listen_port for old configs.
+        self.port = config.get("http_port", config.get("listen_port", 8080))
+        self.socks_enabled = True
         self.socks_host = config.get("socks5_host", self.host)
         self.socks_port = config.get("socks5_port", 1080)
         if self.socks_enabled and self.socks_host == self.host \
                 and int(self.socks_port) == int(self.port):
             raise ValueError(
-                f"listen_port and socks5_port must differ on the same host "
+                f"http_port and socks5_port must differ on the same host "
                 f"(both set to {self.port} on {self.host}). "
                 f"Change one of them in config.json."
             )
@@ -212,6 +107,8 @@ class ProxyServer:
         self._download_max_chunks = self._cfg_int(
             config, "chunked_download_max_chunks", 256, minimum=1,
         )
+        self._warmup_before_listen = True
+        self._warmup_timeout = 20.0
         self._download_extensions, self._download_any_extension = (
             self._normalize_download_extensions(
                 config.get(
@@ -242,12 +139,42 @@ class ProxyServer:
         }
 
         # ── Per-host policy ────────────────────────────────────────
-        # block_hosts  — refuse traffic entirely (close or 403)
-        # bypass_hosts — route directly (no MITM, no relay)
+        # block_hosts   — refuse traffic entirely (close or 403)
+        # direct_hosts  — route directly (no MITM, no relay)
+        # bypass_hosts  — legacy alias kept for backward compatibility
         # Both accept exact hostnames and leading-dot suffix patterns,
         # e.g. ".local" matches any *.local domain.
-        self._block_hosts  = self._load_host_rules(config.get("block_hosts", []))
-        self._bypass_hosts = self._load_host_rules(config.get("bypass_hosts", []))
+        self._block_hosts  = load_host_rules(config.get("block_hosts", []))
+
+        # ── Adblock host lists ─────────────────────────────────────
+        # adblock_lists: list of URLs to hosts-format blocklists.
+        # Lists are loaded from disk cache at startup (fast), then
+        # re-downloaded in background when the cache is stale.
+        self._adblock_urls: list[str] = [
+            str(u).strip() for u in config.get("adblock_lists", []) if u
+        ]
+        if self._adblock_urls:
+            try:
+                from core.adblock import load_all
+                _ab_domains = load_all(self._adblock_urls)
+                self._adblock_hosts = load_host_rules(_ab_domains)
+                log.info(
+                    "Adblock: %d domains active (%d lists)",
+                    len(_ab_domains), len(self._adblock_urls),
+                )
+            except Exception as exc:
+                log.warning("Adblock: failed to load lists at startup: %s", exc)
+                self._adblock_hosts = (set(), ())
+        else:
+            self._adblock_hosts = (set(), ())
+
+        direct_hosts = config.get("direct_hosts", [])
+        bypass_hosts = config.get("bypass_hosts")
+        if bypass_hosts is None:
+            bypass_hosts = list(DEFAULT_BYPASS_HOSTS)
+        self._bypass_hosts = load_host_rules(
+            list(bypass_hosts) + list(direct_hosts)
+        )
 
         # Route YouTube through the relay when requested; the Google frontend
         # IP can enforce SafeSearch on the SNI-rewrite path.
@@ -261,12 +188,17 @@ class ProxyServer:
             self._SNI_REWRITE_SUFFIXES = SNI_REWRITE_SUFFIXES
 
         try:
-            from mitm import MITMCertManager
+            from .mitm import MITMCertManager, CA_CERT_FILE
             self.mitm = MITMCertManager()
+            self._ca_cert_file = CA_CERT_FILE
         except ImportError:
             log.error("Apps Script relay requires the 'cryptography' package.")
             log.error("Run: pip install cryptography")
             raise SystemExit(1)
+
+        # When LAN sharing is active, serve the CA cert over HTTP so other
+        # devices on the network can download and install it easily.
+        self._lan_sharing: bool = bool(config.get("lan_sharing", False))
 
     # ── Host-policy helpers ───────────────────────────────────────
 
@@ -319,136 +251,56 @@ class ProxyServer:
         if task is not None:
             self._client_tasks.discard(task)
 
-    @staticmethod
-    def _load_host_rules(raw) -> tuple[set[str], tuple[str, ...]]:
-        """Accept a list of host strings; return (exact_set, suffix_tuple).
-
-        A rule starting with '.' (e.g. ".internal") is a suffix rule.
-        Everything else is treated as an exact match. Case-insensitive.
-        """
-        exact: set[str] = set()
-        suffixes: list[str] = []
-        for item in raw or []:
-            h = str(item).strip().lower().rstrip(".")
-            if not h:
-                continue
-            if h.startswith("."):
-                suffixes.append(h)
-            else:
-                exact.add(h)
-        return exact, tuple(suffixes)
-
-    @staticmethod
-    def _host_matches_rules(host: str,
-                            rules: tuple[set[str], tuple[str, ...]]) -> bool:
-        exact, suffixes = rules
-        h = host.lower().rstrip(".")
-        if h in exact:
-            return True
-        for s in suffixes:
-            if h.endswith(s):
-                return True
-        return False
-
     def _is_blocked(self, host: str) -> bool:
-        return self._host_matches_rules(host, self._block_hosts)
+        return (
+            host_matches_rules(host, self._block_hosts)
+            or host_matches_rules(host, self._adblock_hosts)
+        )
+
+    async def _refresh_adblock_lists(self) -> None:
+        """Background task: re-download stale adblock lists and hot-swap rules."""
+        if not self._adblock_urls:
+            return
+        try:
+            from core.adblock import refresh_all
+
+            def _update(domains: list[str]) -> None:
+                self._adblock_hosts = load_host_rules(domains)
+                log.info(
+                    "Adblock: rules updated — %d domains active", len(domains)
+                )
+
+            await refresh_all(self._adblock_urls, callback=_update)
+        except Exception as exc:
+            log.warning("Adblock: background refresh failed: %s", exc)
 
     def _is_bypassed(self, host: str) -> bool:
-        return self._host_matches_rules(host, self._bypass_hosts)
-
-    @staticmethod
-    def _header_value(headers: dict | None, name: str) -> str:
-        if not headers:
-            return ""
-        for key, value in headers.items():
-            if key.lower() == name:
-                return str(value)
-        return ""
+        return host_matches_rules(host, self._bypass_hosts)
 
     def _cache_allowed(self, method: str, url: str,
                        headers: dict | None, body: bytes) -> bool:
         if method.upper() != "GET" or body:
             return False
         for name in UNCACHEABLE_HEADER_NAMES:
-            if self._header_value(headers, name):
+            if header_value(headers, name):
                 return False
         return self.fronter._is_static_asset_url(url)
 
-    @classmethod
-    def _should_trace_host(cls, host: str) -> bool:
-        h = host.lower().rstrip(".")
-        return any(
-            token == h or token in h or h.endswith("." + token)
-            for token in cls._TRACE_HOST_SUFFIXES
-        )
-
-    def _log_response_summary(self, url: str, response: bytes):
-        status, headers, body = self.fronter._split_raw_response(response)
-        host = (urlparse(url).hostname or "").lower()
-
-        if status >= 300 or self._should_trace_host(host):
-            location = headers.get("location", "") or "-"
-            server = headers.get("server", "") or "-"
-            cf_ray = headers.get("cf-ray", "") or "-"
-            content_type = headers.get("content-type", "") or "-"
-            body_len = len(body)
-
-            body_hint = "-"
-            rate_limited = False
-
-            # Handle text-like responses (HTML, plain text, JSON…)
-            if ("text" in content_type.lower() or "json" in content_type.lower()) and body:
-                sample = body[:1200].decode(errors="replace").lower()
-
-                # --- Structured HTML title extraction ---
-                if "<title>" in sample and "</title>" in sample:
-                    title = sample.split("<title>", 1)[1].split("</title>", 1)[0]
-                    body_hint = title.strip()[:120] or "-"
-
-                # --- Known content patterns ---
-                elif "captcha" in sample:
-                    body_hint = "captcha"
-                elif "turnstile" in sample:
-                    body_hint = "turnstile"
-                elif "loading" in sample:
-                    body_hint = "loading"
-
-                # --- Rate-limit / quota markers ---
-                rate_limit_markers = (
-                    "too many",
-                    "rate limit",
-                    "quota",
-                    "quota exceeded",
-                    "request limit",
-                    "دفعات زیاد",
-                    "بیش از حد",
-                    "سرویس در طول یک روز",
+    async def start(self):
+        if self._warmup_before_listen:
+            log.info(
+                "Relay warmup in progress... waiting up to %.0fs before opening listeners",
+                self._warmup_timeout,
+            )
+            ready = await self.fronter.wait_until_warm(timeout=self._warmup_timeout)
+            if ready:
+                log.info("Relay warmup complete — enabling HTTP/SOCKS listeners")
+            else:
+                log.warning(
+                    "Relay warmup timed out after %.0fs — starting listeners anyway",
+                    self._warmup_timeout,
                 )
 
-                if any(m in sample for m in rate_limit_markers):
-                    rate_limited = True
-                    body_hint = "quota_exceeded"
-
-            log_msg = (
-                "RESP ← %s status=%s type=%s len=%s server=%s location=%s cf-ray=%s hint=%s"
-            )
-            log_args = (
-                host or url[:60],
-                status,
-                content_type,
-                body_len,
-                server,
-                location,
-                cf_ray,
-                body_hint,
-            )
-
-            if rate_limited:
-                log.warning("RATE LIMIT detected! " + log_msg, *log_args)
-            else:
-                log.info(log_msg, *log_args)
-
-    async def start(self):
         http_srv = await asyncio.start_server(self._on_client, self.host, self.port)
         socks_srv = None
 
@@ -472,6 +324,10 @@ class ProxyServer:
                 "SOCKS5 proxy listening on %s:%d",
                 self.socks_host, self.socks_port,
             )
+
+        # Kick off adblock refresh in the background — won't block startup.
+        if self._adblock_urls:
+            asyncio.create_task(self._refresh_adblock_lists())
 
         try:
             async with http_srv:
@@ -515,6 +371,31 @@ class ProxyServer:
 
     # ── client handler ────────────────────────────────────────────
 
+    async def _serve_ca_cert(self, writer: asyncio.StreamWriter) -> None:
+        """Serve the MITM CA certificate so LAN devices can install it."""
+        import os as _os
+        ca_path = getattr(self, "_ca_cert_file", None)
+        if not ca_path or not _os.path.exists(ca_path):
+            writer.write(
+                b"HTTP/1.1 404 Not Found\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            return
+        with open(ca_path, "rb") as f:
+            cert_data = f.read()
+        headers = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/x-x509-ca-cert\r\n"
+            b"Content-Disposition: attachment; filename=\"ca.crt\"\r\n"
+            + b"Content-Length: " + str(len(cert_data)).encode() + b"\r\n"
+            + b"Connection: close\r\n\r\n"
+        )
+        writer.write(headers + cert_data)
+        await writer.drain()
+        log.info("Served CA certificate to LAN device")
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info("peername")
         task = self._track_current_task()
@@ -534,7 +415,7 @@ class ProxyServer:
                 if line in (b"\r\n", b"\n", b""):
                     break
 
-            if _has_unsupported_transfer_encoding(header_block):
+            if has_unsupported_transfer_encoding(header_block):
                 log.warning("Unsupported Transfer-Encoding on client request")
                 writer.write(
                     b"HTTP/1.1 501 Not Implemented\r\n"
@@ -550,6 +431,11 @@ class ProxyServer:
                 return
 
             method = parts[0].upper()
+            path = parts[1] if len(parts) >= 2 else "/"
+
+            if method == "GET" and path == "/ca.crt" and self._lan_sharing:
+                await self._serve_ca_cert(writer)
+                return
 
             if method == "CONNECT":
                 await self._do_connect(parts[1], reader, writer)
@@ -575,52 +461,12 @@ class ProxyServer:
         addr = writer.get_extra_info("peername")
         task = self._track_current_task()
         try:
-            header = await asyncio.wait_for(reader.readexactly(2), timeout=15)
-            ver, nmethods = header[0], header[1]
-            if ver != 5:
+            result = await negotiate_socks5(reader, writer)
+            if result is None:
                 return
-
-            methods = await asyncio.wait_for(reader.readexactly(nmethods), timeout=10)
-            if 0x00 not in methods:
-                writer.write(b"\x05\xff")
-                await writer.drain()
-                return
-
-            writer.write(b"\x05\x00")
-            await writer.drain()
-
-            req = await asyncio.wait_for(reader.readexactly(4), timeout=15)
-            ver, cmd, _rsv, atyp = req
-            if ver != 5 or cmd != 0x01:
-                writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
-                return
-
-            if atyp == 0x01:
-                raw = await asyncio.wait_for(reader.readexactly(4), timeout=10)
-                host = socket.inet_ntoa(raw)
-            elif atyp == 0x03:
-                ln = (await asyncio.wait_for(reader.readexactly(1), timeout=10))[0]
-                host = (await asyncio.wait_for(reader.readexactly(ln), timeout=10)).decode(
-                    errors="replace"
-                )
-            elif atyp == 0x04:
-                raw = await asyncio.wait_for(reader.readexactly(16), timeout=10)
-                host = socket.inet_ntop(socket.AF_INET6, raw)
-            else:
-                writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
-                return
-
-            port_raw = await asyncio.wait_for(reader.readexactly(2), timeout=10)
-            port = int.from_bytes(port_raw, "big")
-
+            host, port = result
             log.info("SOCKS5 CONNECT → %s:%d", host, port)
-
-            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
             await self._handle_target_tunnel(host, port, reader, writer)
-
         except asyncio.IncompleteReadError:
             pass
         except asyncio.CancelledError:
@@ -673,7 +519,7 @@ class ProxyServer:
             return
 
         if self._is_bypassed(host):
-            log.info("Bypass tunnel → %s:%d (matches bypass_hosts)", host, port)
+            log.info("Direct tunnel → %s:%d (matches direct_hosts/bypass_hosts)", host, port)
             await self._do_direct_tunnel(host, port, reader, writer)
             return
 
@@ -689,7 +535,7 @@ class ProxyServer:
         # clients like Telegram speed up DC-rotation when we fail fast.
         # We remember per-IP failures for a short while so subsequent
         # connects skip the doomed direct attempt.
-        if _is_ip_literal(host):
+        if is_ip_literal(host):
             if not self._direct_temporarily_disabled(host):
                 log.info("Direct tunnel → %s:%d (IP literal)", host, port)
                 ok = await self._do_direct_tunnel(
@@ -1020,21 +866,14 @@ class ProxyServer:
             return
         writer._transport = new_transport
 
-        # Step 2: open outgoing TLS to target IP with the safe SNI
-        ssl_ctx_client = ssl.create_default_context()
-        if certifi is not None:
-            try:
-                ssl_ctx_client.load_verify_locations(cafile=certifi.where())
-            except Exception:
-                pass
-        if not self.fronter.verify_ssl:
-            ssl_ctx_client.check_hostname = False
-            ssl_ctx_client.verify_mode = ssl.CERT_NONE
+        # Step 2: open outgoing TLS to target IP with the safe SNI.
+        # Reuse the SSLContext already built by DomainFronter (certifi bundle,
+        # verify_ssl flag) — no need to rebuild it on every CONNECT.
         try:
             r_out, w_out = await asyncio.wait_for(
                 asyncio.open_connection(
                     target_ip, port,
-                    ssl=ssl_ctx_client,
+                    ssl=self.fronter._ssl_ctx(),
                     server_hostname=sni_out,
                 ),
                 timeout=self._tcp_connect_timeout,
@@ -1096,7 +935,7 @@ class ProxyServer:
             #     either. Telegram will rotate to another DC on its own;
             #     failing fast here lets that happen sooner.
             #   • Client CONNECTs but never speaks TLS (some probes).
-            if _is_ip_literal(host) and port == 443:
+            if is_ip_literal(host) and port == 443:
                 log.info(
                     "Non-TLS traffic on %s:%d (likely Telegram MTProto / "
                     "obfuscated protocol). This DC appears blocked; the "
@@ -1168,7 +1007,7 @@ class ProxyServer:
 
                 # Read body
                 body = b""
-                if _has_unsupported_transfer_encoding(header_block):
+                if has_unsupported_transfer_encoding(header_block):
                     log.warning("Unsupported Transfer-Encoding → %s:%d", host, port)
                     writer.write(
                         b"HTTP/1.1 501 Not Implemented\r\n"
@@ -1177,7 +1016,7 @@ class ProxyServer:
                     )
                     await writer.drain()
                     break
-                length = _parse_content_length(header_block)
+                length = parse_content_length(header_block)
                 if length > MAX_REQUEST_BODY_BYTES:
                     raise ValueError(f"Request body too large: {length} bytes")
                 if length > 0:
@@ -1217,11 +1056,11 @@ class ProxyServer:
                 log.info("MITM → %s %s", method, url)
 
                 # ── CORS: extract relevant request headers ─────────────
-                origin = self._header_value(headers, "origin")
-                acr_method = self._header_value(
+                origin = header_value(headers, "origin")
+                acr_method = header_value(
                     headers, "access-control-request-method",
                 )
-                acr_headers = self._header_value(
+                acr_headers = header_value(
                     headers, "access-control-request-headers",
                 )
 
@@ -1234,7 +1073,7 @@ class ProxyServer:
                         "CORS preflight → %s (responding locally)",
                         url[:60],
                     )
-                    writer.write(self._cors_preflight_response(
+                    writer.write(cors_preflight_response(
                         origin, acr_method, acr_headers,
                     ))
                     await writer.drain()
@@ -1276,9 +1115,15 @@ class ProxyServer:
                 # browser blocks the response even though the relay fetched
                 # it successfully.
                 if origin and response:
-                    response = self._inject_cors_headers(response, origin)
+                    response = inject_cors_headers(response, origin)
 
-                self._log_response_summary(url, response)
+                log_response_summary(
+                    logger=log,
+                    split_raw_response=split_raw_response,
+                    trace_suffixes=self._TRACE_HOST_SUFFIXES,
+                    url=url,
+                    response=response,
+                )
 
                 writer.write(response)
                 await writer.drain()
@@ -1294,59 +1139,7 @@ class ProxyServer:
                 break
 
     # ── CORS helpers ──────────────────────────────────────────────
-
-    @staticmethod
-    def _cors_preflight_response(origin: str, acr_method: str,
-                                 acr_headers: str) -> bytes:
-        """Build a 204 response that satisfies a CORS preflight locally.
-
-        Apps Script's UrlFetchApp does not support OPTIONS, so we have to
-        answer preflights here instead of forwarding them.
-        """
-        allow_origin = origin or "*"
-        allow_methods = (
-            f"{acr_method}, GET, POST, PUT, DELETE, PATCH, OPTIONS"
-            if acr_method else
-            "GET, POST, PUT, DELETE, PATCH, OPTIONS"
-        )
-        allow_headers = acr_headers or "*"
-        return (
-            "HTTP/1.1 204 No Content\r\n"
-            f"Access-Control-Allow-Origin: {allow_origin}\r\n"
-            f"Access-Control-Allow-Methods: {allow_methods}\r\n"
-            f"Access-Control-Allow-Headers: {allow_headers}\r\n"
-            "Access-Control-Allow-Credentials: true\r\n"
-            "Access-Control-Max-Age: 86400\r\n"
-            "Vary: Origin\r\n"
-            "Content-Length: 0\r\n"
-            "\r\n"
-        ).encode()
-
-    @staticmethod
-    def _inject_cors_headers(response: bytes, origin: str) -> bytes:
-        """Strip existing Access-Control-* headers and add permissive ones.
-
-        Keeps the body untouched; only rewrites the header block. Using
-        the exact browser-supplied Origin (rather than "*") is required
-        when the request is credentialed (cookies, Authorization).
-        """
-        sep = b"\r\n\r\n"
-        if sep not in response:
-            return response
-        header_section, body = response.split(sep, 1)
-        lines = header_section.decode(errors="replace").split("\r\n")
-        lines = [ln for ln in lines
-                 if not ln.lower().startswith("access-control-")]
-        allow_origin = origin or "*"
-        lines += [
-            f"Access-Control-Allow-Origin: {allow_origin}",
-            "Access-Control-Allow-Credentials: true",
-            "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS",
-            "Access-Control-Allow-Headers: *",
-            "Access-Control-Expose-Headers: *",
-            "Vary: Origin",
-        ]
-        return ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+    # cors_preflight_response() and inject_cors_headers() live in proxy_support.
 
     async def _relay_smart(self, method, url, headers, body):
         """Choose optimal relay strategy based on request type.
@@ -1360,12 +1153,8 @@ class ProxyServer:
         """
         if method == "GET" and not body:
             # Respect client's own Range header verbatim.
-            if headers:
-                for k in headers:
-                    if k.lower() == "range":
-                        return await self.fronter.relay(
-                            method, url, headers, body
-                        )
+            if header_value(headers, "range"):
+                return await self.fronter.relay(method, url, headers, body)
             # Only probe with Range when the URL looks like a big file.
             if self._is_likely_download(url, headers):
                 return await self.fronter.relay_parallel(
@@ -1388,7 +1177,7 @@ class ProxyServer:
         for ext in self._download_extensions:
             if path.endswith(ext):
                 return True
-        accept = self._header_value(headers, "accept").lower()
+        accept = header_value(headers, "accept").lower()
         if any(marker in accept for marker in self._DOWNLOAD_ACCEPT_MARKERS):
             return True
         return False
@@ -1398,10 +1187,8 @@ class ProxyServer:
                                      writer) -> bool:
         if method.upper() != "GET" or body:
             return False
-        if headers:
-            for key in headers:
-                if key.lower() == "range":
-                    return False
+        if header_value(headers, "range"):
+            return False
         effective_headers = headers or {}
         if not self._is_likely_download(url, effective_headers):
             return False
@@ -1421,7 +1208,7 @@ class ProxyServer:
 
     async def _do_http(self, header_block: bytes, reader, writer):
         body = b""
-        if _has_unsupported_transfer_encoding(header_block):
+        if has_unsupported_transfer_encoding(header_block):
             log.warning("Unsupported Transfer-Encoding on plain HTTP request")
             writer.write(
                 b"HTTP/1.1 501 Not Implemented\r\n"
@@ -1430,7 +1217,7 @@ class ProxyServer:
             )
             await writer.drain()
             return
-        length = _parse_content_length(header_block)
+        length = parse_content_length(header_block)
         if length > MAX_REQUEST_BODY_BYTES:
             writer.write(b"HTTP/1.1 413 Content Too Large\r\n\r\n")
             await writer.drain()
@@ -1453,12 +1240,12 @@ class ProxyServer:
                 headers[k.strip()] = v.strip()
 
         # ── CORS preflight over plain HTTP ─────────────────────────────
-        origin = self._header_value(headers, "origin")
-        acr_method = self._header_value(headers, "access-control-request-method")
-        acr_headers = self._header_value(headers, "access-control-request-headers")
+        origin = header_value(headers, "origin")
+        acr_method = header_value(headers, "access-control-request-method")
+        acr_headers = header_value(headers, "access-control-request-headers")
         if method.upper() == "OPTIONS" and acr_method:
             log.debug("CORS preflight (HTTP) → %s (responding locally)", url[:60])
-            writer.write(self._cors_preflight_response(
+            writer.write(cors_preflight_response(
                 origin, acr_method, acr_headers,
             ))
             await writer.drain()
@@ -1483,9 +1270,15 @@ class ProxyServer:
                     self._cache.put(url, response, ttl)
 
         if origin and response:
-            response = self._inject_cors_headers(response, origin)
+            response = inject_cors_headers(response, origin)
 
-        self._log_response_summary(url, response)
+        log_response_summary(
+            logger=log,
+            split_raw_response=split_raw_response,
+            trace_suffixes=self._TRACE_HOST_SUFFIXES,
+            url=url,
+            response=response,
+        )
 
         writer.write(response)
         await writer.drain()

@@ -24,10 +24,10 @@ from cryptography.x509.oid import NameOID
 
 log = logging.getLogger("MITM")
 
-# CA lives at the project root (../ca/ relative to this file in src/).
-# The installed trusted root was generated there; keep using it.
+# Keep the CA at repository root so docs/installer paths stay stable.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+_SRC_DIR = os.path.dirname(_THIS_DIR)
+_PROJECT_ROOT = os.path.dirname(_SRC_DIR)
 CA_DIR = os.path.join(_PROJECT_ROOT, "ca")
 CA_KEY_FILE = os.path.join(CA_DIR, "ca.key")
 CA_CERT_FILE = os.path.join(CA_DIR, "ca.crt")
@@ -137,6 +137,14 @@ class MITMCertManager:
                 f.write(cert_pem + ca_pem)
             with open(key_file, "wb") as f:
                 f.write(key_pem)
+            # Restrict private key to current user only on POSIX.
+            # os.chmod is effectively a no-op on Windows (NTFS ACLs govern
+            # access there), but the temp directory is already user-scoped.
+            if os.name == "posix":
+                try:
+                    os.chmod(key_file, 0o600)
+                except OSError:
+                    pass
 
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.set_alpn_protocols(["http/1.1"])

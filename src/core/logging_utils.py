@@ -61,6 +61,12 @@ LEVEL_LABEL = {
     "CRITICAL": "CRIT ",
 }
 
+# Special spotlight line for execution usage updates.
+EXEC_USAGE_PREFIX = "Apps Script executions used so far:"
+
+# Spotlight line for the CA certificate LAN download URL.
+CA_DOWNLOAD_PREFIX = "CA certificate download"
+
 # Stable per-component color (keeps log scanning easy).
 COMPONENT_COLORS = {
     "Main":         FG_CYAN,
@@ -148,14 +154,40 @@ class PrettyFormatter(logging.Formatter):
         except Exception:
             message = record.msg
 
-        time_part  = self._fmt_time(record)
-        level_part = self._fmt_level(record.levelname)
-        comp_part  = self._fmt_component(record.name)
+        highlight_exec_usage = (
+            record.name == "Fronter"
+            and isinstance(message, str)
+            and message.startswith(EXEC_USAGE_PREFIX)
+        )
+        highlight_ca_download = (
+            isinstance(message, str)
+            and message.startswith(CA_DOWNLOAD_PREFIX)
+        )
 
-        if self.use_color:
-            time_part = f"{DIM}{FG_GRAY}{time_part}{RESET}"
+        if highlight_ca_download:
+            plain_time = self._fmt_time(record)
+            plain_level = f"{LEVEL_GLYPH.get(record.levelname, '·')} {LEVEL_LABEL.get(record.levelname, record.levelname[:5].ljust(5))}"
+            plain_comp = f"[{record.name[: self.COMPONENT_WIDTH].ljust(self.COMPONENT_WIDTH)}]"
+            line = f"{plain_time}  {plain_level}  {plain_comp}  {message}"
+            if self.use_color:
+                line = f"{BOLD}{FG_GREEN}{line}{RESET}"
+        elif highlight_exec_usage:
+            # Force a single vivid color for the entire line so this metric pops.
+            plain_time = self._fmt_time(record)
+            plain_level = f"{LEVEL_GLYPH.get(record.levelname, '·')} {LEVEL_LABEL.get(record.levelname, record.levelname[:5].ljust(5))}"
+            plain_comp = f"[{record.name[: self.COMPONENT_WIDTH].ljust(self.COMPONENT_WIDTH)}]"
+            line = f"{plain_time}  {plain_level}  {plain_comp}  {message}"
+            if self.use_color:
+                line = f"{BOLD}{FG_CYAN}{line}{RESET}"
+        else:
+            time_part = self._fmt_time(record)
+            level_part = self._fmt_level(record.levelname)
+            comp_part = self._fmt_component(record.name)
 
-        line = f"{time_part}  {level_part}  {comp_part}  {message}"
+            if self.use_color:
+                time_part = f"{DIM}{FG_GRAY}{time_part}{RESET}"
+
+            line = f"{time_part}  {level_part}  {comp_part}  {message}"
 
         # Exception tracebacks: render dimmed below the main line.
         if record.exc_info:
@@ -227,44 +259,43 @@ def _install_asyncio_noise_filter() -> None:
 
 
 def print_banner(version: str, *, stream=None) -> None:
-    """Print a polished startup banner with color fallbacks."""
+    """Print an ASCII startup banner with color fallbacks."""
     stream = stream or sys.stderr
     color = _supports_color(stream)
 
     def c(code: str) -> str:
         return code if color else ""
 
-    title = "MasterHttpRelayVPN"
-    subtitle = "Domain-Fronted Apps Script Relay"
-    version_tag = f"v{version}"
-
-    left = f" {title} "
-    center = f" {subtitle} "
-    right = f" {version_tag} "
-    inner_width = max(68, len(left) + len(center) + len(right) + 2)
-
-    gap = inner_width - (len(left) + len(center) + len(right))
-    left_gap = gap // 2
-    right_gap = gap - left_gap
-
-    top = "╭" + ("─" * inner_width) + "╮"
-    mid = "│" + left + (" " * left_gap) + center + (" " * right_gap) + right + "│"
-    bot = "╰" + ("─" * inner_width) + "╯"
+    art = [
+        " __  __    _    ____ _____ _____ ____  ",
+        "|  \\/  |  / \\  / ___|_   _| ____|  _ \\ ",
+        "| |\\/| | / _ \\ \\___ \\ | | |  _| | |_) |",
+        "| |  | |/ ___ \\ ___) || | | |___|  _ < ",
+        "|_|  |_/_/   \\_\\____/ |_| |_____|_| \\_\\",
+        "      _   _ _____ _____ ____     ____  _____ _        _ __   __",
+        "     | | | |_   _|_   _|  _ \\   |  _ \\| ____| |      / \\\\ \\ / /",
+        "     | |_| | | |   | | | |_) |  | |_) |  _| | |     / _ \\\\ V / ",
+        "     |  _  | | |   | | |  __/   |  _ <| |___| |___ / ___ \\| |  ",
+        "     |_| |_| |_|   |_| |_|      |_| \\_\\_____|_____/_/   \\_\\_|  ",
+    ]
+    version_line = f"Version {version}"
+    link = "https://github.com/masterking32/MasterHttpRelayVPN"
+    width = max(max(len(line) for line in art), len(version_line), len(link))
+    rule = "=" * width
 
     if color:
-        top = f"{DIM}{FG_GRAY}{top}{RESET}"
-        bot = f"{DIM}{FG_GRAY}{bot}{RESET}"
-        mid = (
-            f"{DIM}{FG_GRAY}│{RESET}"
-            f"{BOLD}{FG_CYAN}{left}{RESET}"
-            f"{' ' * left_gap}"
-            f"{FG_GRAY}{center}{RESET}"
-            f"{' ' * right_gap}"
-            f"{BOLD}{FG_TEAL}{right}{RESET}"
-            f"{DIM}{FG_GRAY}│{RESET}"
-        )
+        print(f"{DIM}{FG_GRAY}{rule}{RESET}", file=stream)
+        for line in art:
+            print(f"{BOLD}{FG_CYAN}{line.center(width)}{RESET}", file=stream)
+        print(f"{FG_GRAY}{version_line.center(width)}{RESET}", file=stream)
+        print(f"{FG_TEAL}{link.center(width)}{RESET}", file=stream)
+        print(f"{DIM}{FG_GRAY}{rule}{RESET}", file=stream)
+    else:
+        print(rule, file=stream)
+        for line in art:
+            print(line.center(width), file=stream)
+        print(version_line.center(width), file=stream)
+        print(link.center(width), file=stream)
+        print(rule, file=stream)
 
-    print(top, file=stream)
-    print(mid, file=stream)
-    print(bot, file=stream)
     stream.flush()

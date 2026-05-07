@@ -1,12 +1,13 @@
 # MasterHttpRelayVPN
 
-[![GitHub](https://img.shields.io/badge/GitHub-MasterHttpRelayVPN-blue?logo=github)](https://github.com/masterking32/MasterHttpRelayVPN)
+[![GitHub](https://img.shields.io/badge/GitHub-MasterHttpRelayVPN-blue?logo=github)](https://github.com/masterking32/MasterHttpRelayVPN) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/masterking32/MasterHttpRelayVPN) [![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/85a1f608-5c6d-4fcd-9b7f-b1ff8b680852.svg)](https://oosmetrics.com/repo/masterking32/MasterHttpRelayVPN) [![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/de9bee73-bc68-4f98-ba83-6957007046b1.svg)](https://oosmetrics.com/repo/masterking32/MasterHttpRelayVPN)
 
 **[🇮🇷 راهنمای فارسی (Persian)](README_FA.md)**
 
 A free tool that lets you access the internet freely by hiding your traffic behind trusted websites like Google. No VPS or server needed — just a free Google account.
 
 > **How it works in simple terms:** Your browser talks to this tool on your computer. This tool disguises your traffic to look like normal Google traffic. The firewall/filter sees "google.com" and lets it pass. Behind the scenes, a free Google Apps Script relay fetches the real website for you.
+
 
 ---
 
@@ -92,10 +93,6 @@ and generates a strong random password for you. Follow the Apps Script deploymen
 instructions in **Step 2** below before running the wizard so you have a
 Deployment ID ready.
 
-After it's running, jump to **Step 5** (browser proxy) and **Step 6** (CA
-certificate).
-
----
 
 ## Step-by-Step Setup Guide (Manual)
 
@@ -132,6 +129,8 @@ This is the "relay" that sits on Google's servers and fetches websites for you. 
    - **Execute as:** Me
    - **Who has access:** Anyone
 9. Click **Deploy**.
+   - If prompted, click **Authorize access**.
+   - You may see **Google hasn't verified this app**. Click **Advanced** then **Go to <your project name> (unsafe)** to continue.
 10. **Copy the Deployment ID** (it looks like a long random string). You'll need it in the next step.
 
 > ⚠️ Remember the password you set in step 5. You'll use the same password in the config file below.
@@ -156,14 +155,12 @@ It'll prompt for your Deployment ID, generate a random `auth_key`, and write
 2. Open `config.json` in any text editor and fill in your values:
    ```json
    {
-     "mode": "apps_script",
      "google_ip": "216.239.38.120",
      "front_domain": "www.google.com",
      "script_id": "PASTE_YOUR_DEPLOYMENT_ID_HERE",
      "auth_key": "your-secret-password-here",
      "listen_host": "127.0.0.1",
-     "listen_port": 8085,
-     "socks5_enabled": true,
+    "http_port": 8085,
      "socks5_port": 1080,
      "log_level": "INFO",
      "verify_ssl": true
@@ -178,17 +175,17 @@ Some websites block Google datacenter IPs when traffic exits directly from Apps 
 To fix that, configure an exit node so traffic path becomes:
 
 ```text
-Browser -> Local Proxy -> Apps Script -> Exit Node (Val Town / Cloudflare / Deno) -> Target website
+Browser -> Local Proxy -> Apps Script -> Exit Node (Cloudflare / Deno / VPS) -> Target website
 ```
 
-You can deploy any one of these free exit-node templates:
+You can deploy any one of these exit-node backends:
 
-1. Val Town: [`apps_script/valtown.ts`](apps_script/valtown.ts)
-2. Cloudflare Workers: [`apps_script/cloudflare_worker.js`](apps_script/cloudflare_worker.js)
-3. Deno Deploy: [`apps_script/deno_deploy.ts`](apps_script/deno_deploy.ts)
+1. Cloudflare Workers: [`apps_script/cloudflare_worker.js`](apps_script/cloudflare_worker.js)
+2. Deno Deploy: [`apps_script/deno_deploy.ts`](apps_script/deno_deploy.ts)
+3. Your own VPS server
 
 Full step-by-step deployment guide (all providers):
-- [EXIT_NODE_DEPLOYMENT.md](EXIT_NODE_DEPLOYMENT.md)
+- [docs/exit-node/EXIT_NODE_DEPLOYMENT.md](docs/exit-node/EXIT_NODE_DEPLOYMENT.md)
 
 Set the same PSK secret inside the exit-node code (`PSK` constant) and in `config.json`.
 
@@ -197,8 +194,8 @@ Then configure provider switching like this:
 ```json
 "exit_node": {
   "enabled": true,
-  "provider": "valtown",
-  "url": "https://YOUR-NAME.web.val.run",
+  "provider": "cloudflare",
+  "url": "https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev",
   "psk": "CHANGE_ME_TO_A_STRONG_SECRET",
   "mode": "full",
   "hosts": [
@@ -211,7 +208,7 @@ Then configure provider switching like this:
 ```
 
 Notes:
-- For noob setup, only fill `provider`, `url`, and `psk`.
+- For simple setup, only fill `provider`, `url`, and `psk`.
 - Switch provider by changing `exit_node.provider` and `exit_node.url`.
 - `mode: "full"` = everything goes through exit node (ignore `hosts`).
 - `mode: "selective"` = only domains in `hosts` go through exit node.
@@ -221,7 +218,7 @@ Production recommendation:
 - Keep `verify_ssl: true`
 - Keep `listen_host: 127.0.0.1` unless LAN sharing is explicitly needed
 - Rotate both secrets periodically
-- Never publish your live val URL with valid PSK
+- Never publish your live exit-node URL with valid PSK
 
 ### Step 4: Run
 
@@ -302,7 +299,7 @@ By default, the proxy only listens on `127.0.0.1` (localhost), meaning only your
 {
   "lan_sharing": true,
   "listen_host": "0.0.0.0",
-  "listen_port": 8085
+  "http_port": 8085
 }
 ```
 
@@ -312,9 +309,50 @@ By default, the proxy only listens on `127.0.0.1` (localhost), meaning only your
 
 ---
 
+## Docker (Optional)
+
+If you prefer running the proxy in a container instead of managing a Python environment, Docker is supported.
+
+**Requirements:** [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/)
+
+### Setup
+
+1. Copy and fill in your config:
+   ```bash
+   cp config.example.json config.json
+   # Edit config.json — set your script_id and auth_key
+   ```
+
+2. Build and start:
+   ```bash
+   docker compose up -d
+   ```
+
+The container automatically listens on `0.0.0.0`, so both ports are reachable from the host:
+- `127.0.0.1:8085` — HTTP proxy
+- `127.0.0.1:1080` — SOCKS5 proxy
+
+### CA Certificate in Docker
+
+On first run, the container generates `ca/ca.crt` into the `./ca` volume on your host. Install it in your browser manually — see [Step 6](#step-6-install-the-ca-certificate-required-for-https) above. Running `--install-cert` inside the container has no effect on the host OS certificate store.
+
+### Useful Commands
+
+```bash
+docker compose up -d          # Start in background
+docker compose logs -f        # Follow logs
+docker compose restart        # Restart after config change
+docker compose down           # Stop and remove container
+docker compose build          # Rebuild image after code change
+```
+
+> **`config.json` is mounted read-only** into the container and is never baked into the image, so your secrets stay on the host.
+
+---
+
 ## Modes Overview
 
-This project is centered on the **Apps Script** relay (free, no VPS needed). For destinations that block Google egress, you can optionally chain a free edge exit node (Val Town, Cloudflare Workers, or Deno Deploy).
+This project is centered on the **Apps Script** relay (free, no VPS needed). For destinations that block Google egress, you can optionally chain an edge exit node (Cloudflare Workers, Deno Deploy, or your own VPS).
 
 ---
 
@@ -327,7 +365,7 @@ This project is centered on the **Apps Script** relay (free, no VPS needed). For
 | `auth_key` | Password shared between your computer and the relay |
 | `script_id` | Your Google Apps Script Deployment ID |
 | `listen_host` | Where to listen (`127.0.0.1` = only this computer, `0.0.0.0` = all interfaces for LAN sharing) |
-| `listen_port` | Which port to listen on (default: `8085`) |
+| `http_port` | Which HTTP proxy port to listen on (default: `8085`) |
 | `lan_sharing` | Enable LAN sharing to allow other devices on your network to use the proxy (`false` by default) |
 | `log_level` | How much detail to show: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -341,20 +379,45 @@ This project is centered on the **Apps Script** relay (free, no VPS needed). For
 | `relay_timeout` | `25` | Total timeout for one relayed request before it fails |
 | `tls_connect_timeout` | `15` | Timeout for the proxy's TLS connection to the fronted Google/CDN endpoint |
 | `tcp_connect_timeout` | `10` | Timeout for direct TCP tunnels and outbound SNI-rewrite connects |
-| `max_response_body_bytes` | `209715200` | Hard cap for a single relay response body after buffering/decoding |
 | `script_ids` | — | Multiple Script IDs for load balancing (array) |
 | `chunked_download_extensions` | see [config.example.json](config.example.json) | File extensions that should use parallel range downloading. Supports `".*"` to probe all GET downloads. |
 | `chunked_download_min_size` | `5242880` | Minimum total file size (5 MB) before range-parallel download stays enabled |
 | `chunked_download_chunk_size` | `524288` | Per-range chunk size used by parallel downloads |
 | `chunked_download_max_parallel` | `8` | Maximum simultaneous range requests for one download |
 | `chunked_download_max_chunks` | `256` | Soft upper bound for total chunk requests; chunk size is raised automatically for very large files |
+| `hosts` | `{}` | Manual DNS override map (`hostname` or `.suffix` -> IP). Example: `{ "example.org": "93.184.216.34", ".internal.lan": "192.168.1.10" }`. |
 | `block_hosts` | `[]` | Hosts that must never be tunneled (return HTTP 403). Supports exact names (`ads.example.com`) or leading-dot suffixes (`.doubleclick.net`). |
+| `direct_hosts` | `[]` | Hosts that must always go direct (no MITM and no relay/domain-fronting). Supports exact names and leading-dot suffixes. |
 | `bypass_hosts` | `["localhost", ".local", ".lan", ".home.arpa"]` | Hosts that go direct (no MITM, no relay). Useful for LAN resources or sites that break under MITM. |
 | `direct_google_exclude` | see [config.example.json](config.example.json) | Google apps that must use the MITM relay path instead of the fast direct tunnel. |
-| `hosts` | `{}` | Manual DNS override: map a hostname to a specific IP. |
 | `youtube_via_relay` | `false` | Route YouTube (`youtube.com`, `youtu.be`, `youtube-nocookie.com`) through the Apps Script relay instead of the SNI-rewrite path. The SNI-rewrite path uses Google's frontend IP which enforces SafeSearch and can cause **"Video Unavailable"** errors. Setting this to `true` fixes playback at the cost of using more Apps Script executions and slightly higher latency. |
-| `exit_node.provider` | `valtown` | Selected exit-node backend: `valtown`, `cloudflare`, `deno`, or `custom`. |
+| `exit_node.provider` | `cloudflare` | Selected exit-node backend: `cloudflare`, `deno`, `vps`, or `custom`. |
 | `exit_node.url` | `""` | Beginner-friendly single URL for the selected provider. |
+
+Practical host-policy example:
+
+```json
+{
+  "block_hosts": [
+    "ads.example.com",
+    ".doubleclick.net"
+  ],
+  "direct_hosts": [
+    "chat.openai.com",
+    ".openai.com"
+  ],
+  "hosts": {
+    "example.org": "93.184.216.34",
+    ".internal.lan": "192.168.1.10"
+  }
+}
+```
+
+- `block_hosts`: deny requests entirely (`403`) for exact names or full suffix trees.
+- `direct_hosts`: force plain direct tunnel only (no MITM, no relay fronting).
+- `hosts`: force DNS mapping before any real lookup (useful for testing/split-DNS workarounds).
+
+Note: the relay response body cap is now a code constant (`MAX_RESPONSE_BODY_BYTES`) in [src/core/constants.py](src/core/constants.py), not a user config key.
 
 ### Optional Dependencies
 
@@ -396,7 +459,6 @@ If you change `Code.gs`, you must **create a new deployment** in Google Apps Scr
 python3 main.py                          # Normal start
 python3 main.py -p 9090                  # Use HTTP port 9090 instead
 python3 main.py --socks5-port 1081       # Use SOCKS5 port 1081
-python3 main.py --disable-socks5         # Disable SOCKS5 listener
 python3 main.py --log-level DEBUG        # Show detailed logs
 python3 main.py -c /path/to/config.json  # Use a different config file
 python3 main.py --install-cert           # Install MITM CA certificate and exit
@@ -451,52 +513,6 @@ After scanning, update your `config.json` with the recommended IP and restart th
 
 ---
 
-## CI/CD Releases (Hidden First Release)
-
-This repository includes a release workflow at `.github/workflows/release.yml`.
-
-Default behavior is **hidden for users**:
-- Tag push (`v*`) creates a GitHub Release as **draft** + **prerelease**
-- It is not marked as **Latest**
-
-That means you can run the first release via CI/CD, verify assets, and publish later.
-
-### Create first hidden release from GitHub Actions
-
-1. Push a tag:
-  ```bash
-  git tag v1.1.0
-  git push origin v1.1.0
-  ```
-2. Wait for the **Release** workflow to finish.
-3. Open GitHub Releases and review the draft release artifacts.
-
-### Make it public later
-
-Run **Actions → Release → Run workflow** with:
-- `publish = true`
-- `release_tag = v1.1.0`
-- `make_public = true`
-
-This will publish a non-draft, non-prerelease release and mark it as latest.
-
-### Extra targets (optional, non-blocking)
-
-`macos-13` runners can be heavily queued, which may leave `macos-x64` waiting for a long time.
-To keep normal releases fast and reliable, default tag releases now build:
-- `windows-x64`
-- `linux-x64`
-- `macos-arm64`
-
-If you want extra targets, run **Actions -> Release -> Run workflow** and enable one or more:
-- `build_macos_x64 = true` (intel macOS)
-- `build_linux_arm64 = true` (native ARM64 Linux runner)
-- `build_termux_bundle = true` (Termux source package for arm64/armv7/x86_64 on-device install)
-
-These extra jobs are optional and non-blocking, so even if one is delayed or unavailable, your main release still completes.
-
----
-
 ## Architecture
 
 ```
@@ -519,9 +535,10 @@ MasterHttpRelayVPN/
 ├── start.bat / start.sh       # One-click launcher (venv + deps + wizard + run)
 ├── config.example.json        # Copy to config.json and fill in your values
 ├── requirements.txt           # Python dependencies
+├── Dockerfile                 # Container image definition
+├── docker-compose.yml         # Compose config: ports, volumes, restart policy
 ├── apps_script/
 │   ├── Code.gs                # The relay script you deploy to Google Apps Script
-│   ├── valtown.ts             # Exit node template for val.town
 │   ├── cloudflare_worker.js   # Exit node template for Cloudflare Workers
 │   └── deno_deploy.ts         # Exit node template for Deno Deploy
 ├── ca/                        # Generated MITM CA (do NOT share)
@@ -570,6 +587,10 @@ MasterHttpRelayVPN/
 ## Special Thanks
 
 Special thanks to [@abolix](https://github.com/abolix) for making this project possible.
+
+## Sources
+
+- **Ad blocker filter lists:** [PersianBlocker](https://github.com/MasterKia/PersianBlocker/) by MasterKia
 
 ## License
 

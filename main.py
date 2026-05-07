@@ -14,23 +14,19 @@ import logging
 import os
 import sys
 
-# Project modules live under ./src — put that folder on sys.path so the
-# historical flat imports ("from proxy_server import …") keep working.
+# Project modules live under ./src — add it to sys.path so package imports
+# like "from proxy.proxy_server import ProxyServer" work from project root.
 _SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from cert_installer import install_ca, uninstall_ca, is_ca_trusted
-from constants import __version__
-from lan_utils import log_lan_access
-from google_ip_scanner import scan_sync
-from logging_utils import configure as configure_logging, print_banner
-from mitm import CA_CERT_FILE
-from proxy_server import ProxyServer
-
-
-def setup_logging(level_name: str):
-    configure_logging(level_name)
+from core.cert_installer import install_ca, uninstall_ca, is_ca_trusted
+from core.constants import __version__
+from core.lan_utils import log_lan_access
+from core.google_ip_scanner import scan_sync
+from core.logging_utils import configure as configure_logging, print_banner
+from proxy.mitm import CA_CERT_FILE
+from proxy.proxy_server import ProxyServer
 
 
 _PLACEHOLDER_AUTH_KEYS = {
@@ -54,7 +50,7 @@ def parse_args():
         "-p", "--port",
         type=int,
         default=None,
-        help="Override listen port (env: DFT_PORT)",
+        help="Override HTTP proxy port (env: DFT_HTTP_PORT, legacy: DFT_PORT)",
     )
     parser.add_argument(
         "--host",
@@ -70,7 +66,7 @@ def parse_args():
     parser.add_argument(
         "--disable-socks5",
         action="store_true",
-        help="Disable the built-in SOCKS5 listener.",
+        help="Deprecated: SOCKS5 listener is always enabled.",
     )
     parser.add_argument(
         "--log-level",
@@ -111,13 +107,13 @@ def main():
 
     # Handle cert-only commands before loading config so they can run standalone.
     if args.install_cert or args.uninstall_cert:
-        setup_logging("INFO")
+        configure_logging("INFO")
         _log = logging.getLogger("Main")
 
         if args.install_cert:
             _log.info("Installing CA certificate…")
             if not os.path.exists(CA_CERT_FILE):
-                from mitm import MITMCertManager
+                from proxy.mitm import MITMCertManager
                 MITMCertManager()  # side-effect: creates ca/ca.crt + ca/ca.key
             ok = install_ca(CA_CERT_FILE)
             sys.exit(0 if ok else 1)
@@ -174,9 +170,15 @@ def main():
 
     # CLI argument overrides
     if args.port is not None:
-        config["listen_port"] = args.port
+        config["http_port"] = args.port
+    elif os.environ.get("DFT_HTTP_PORT"):
+        config["http_port"] = int(os.environ["DFT_HTTP_PORT"])
     elif os.environ.get("DFT_PORT"):
-        config["listen_port"] = int(os.environ["DFT_PORT"])
+        config["http_port"] = int(os.environ["DFT_PORT"])
+
+    # Backward compatibility for older config files.
+    if "http_port" not in config:
+        config["http_port"] = int(config.get("listen_port", 8080))
 
     if args.host is not None:
         config["listen_host"] = args.host
@@ -189,7 +191,12 @@ def main():
         config["socks5_port"] = int(os.environ["DFT_SOCKS5_PORT"])
 
     if args.disable_socks5:
-        config["socks5_enabled"] = False
+        logging.getLogger("Main").warning(
+            "--disable-socks5 is deprecated and ignored: SOCKS5 is always enabled."
+        )
+
+    # Keep runtime behavior fixed regardless of user config values.
+    config["socks5_enabled"] = True
 
     if args.log_level is not None:
         config["log_level"] = args.log_level
@@ -219,14 +226,14 @@ def main():
 
     # ── Google IP Scanner ──────────────────────────────────────────────────
     if args.scan:
-        setup_logging("INFO")
+        configure_logging("INFO")
         front_domain = config.get("front_domain", "www.google.com")
         _log = logging.getLogger("Main")
         _log.info(f"Scanning Google IPs (fronting domain: {front_domain})")
         ok = scan_sync(front_domain)
         sys.exit(0 if ok else 1)
 
-    setup_logging(config.get("log_level", "INFO"))
+    configure_logging(config.get("log_level", "INFO"))
     log = logging.getLogger("Main")
 
     print_banner(__version__)
@@ -238,14 +245,18 @@ def main():
     if isinstance(script_ids, list):
         log.info("Script IDs        : %d scripts (sticky per-host)", len(script_ids))
         for i, sid in enumerate(script_ids):
-            log.info("  [%d] %s", i + 1, sid)
+            _s = str(sid)
+            masked = f"{_s[:6]}…{_s[-4:]}" if len(_s) > 12 else _s
+            log.info("  [%d] %s", i + 1, masked)
     else:
-        log.info("Script ID         : %s", script_ids)
+        _s = str(script_ids) if script_ids else "(none)"
+        masked = f"{_s[:6]}…{_s[-4:]}" if len(_s) > 12 else _s
+        log.info("Script ID         : %s", masked)
 
     # Ensure CA file exists before checking / installing it.
     # MITMCertManager generates ca/ca.crt on first instantiation.
     if not os.path.exists(CA_CERT_FILE):
-        from mitm import MITMCertManager
+        from proxy.mitm import MITMCertManager
         MITMCertManager()  # side-effect: creates ca/ca.crt + ca/ca.key
 
     # Auto-install MITM CA if not already trusted
@@ -277,13 +288,29 @@ def main():
     # print concrete IPv4 addresses users can use on other devices.
     lan_mode = lan_sharing or listen_host in ("0.0.0.0", "::")
     if lan_mode:
-        socks_port = config.get("socks5_port", 1080) if config.get("socks5_enabled", True) else None
-        log_lan_access(config.get("listen_port", 8080), socks_port)
+        http_port = config.get("http_port", config.get("listen_port", 8080))
+        socks_port = config.get("socks5_port", 1080)
+        log_lan_access(http_port, socks_port)
+
+        if lan_sharing:
+            # Log CA download URLs so LAN devices know where to get the cert.
+            from core.lan_utils import get_lan_ips
+            ca_urls = [f"http://{addr}/ca.crt" for addr in get_lan_ips(http_port)]
+            if ca_urls:
+                log.info(
+                    "CA certificate download (install on other devices): %s",
+                    "  OR  ".join(ca_urls),
+                )
+            else:
+                log.info(
+                    "CA certificate download: http://<your-LAN-IP>:%d/ca.crt", http_port
+                )
 
     try:
         asyncio.run(_run(config))
     except KeyboardInterrupt:
         log.info("Stopped")
+
 
 
 def _make_exception_handler(log):
@@ -314,6 +341,12 @@ async def _run(config):
         await server.start()
     finally:
         await server.stop()
+        # Cancel any tasks that leaked through (e.g. fire-and-forget pool tasks).
+        stray = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for t in stray:
+            t.cancel()
+        if stray:
+            await asyncio.gather(*stray, return_exceptions=True)
 
 
 if __name__ == "__main__":
